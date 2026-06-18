@@ -1,0 +1,8 @@
+# Cursor indexing config
+.cursorindexingignore
+
+# SpecStory
+.specstory/
+.vscode/
+.cursor/
+.claude/
