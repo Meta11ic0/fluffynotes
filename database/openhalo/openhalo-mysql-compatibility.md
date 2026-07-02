@@ -52,26 +52,28 @@ mysql.port = 3306
 
 ## 0. PG 原版信息流（对照基准）
 
-PostgreSQL 14 处理一条客户端 SQL 的**时间顺序**如下。OpenHalo 在标有 ★ 的环节插入分叉，其余大量复用 PG 存储、事务、锁、WAL。
+PostgreSQL 14 处理一条客户端 SQL 的**时间顺序**如下。OpenHalo 在标有 **★（F1–F9）** 的环节插入分叉（含义见上文「九个分叉点一览」），其余大量复用 PG 存储、事务、锁、WAL。
 
 ```mermaid
 flowchart TB
     C[客户端] --> PM[PostmasterMain]
-    PM --> L[StreamServerPort 填 ListenSocket]
+    PM --> L["★ F1 StreamServerPort 填 ListenSocket"]
     L --> SL[ServerLoop]
-    SL --> CC[ConnCreate → StreamConnection]
+    SL --> CC["★ F1 ConnCreate → accept"]
     CC --> BS[BackendStartup fork]
     BS --> BI[BackendInitialize]
     BI --> PSP[ProcessStartupPacket]
-    PSP --> IP[InitPostgres → PerformAuthentication]
-    IP --> PMN[PostgresMain]
-    PMN --> RC[ReadCommand → SocketBackend]
-    RC --> ESQ[exec_simple_query]
-    ESQ --> RP[raw_parser → gram.y]
-    RP --> PA[parse_analyze / transformStmt]
-    PA --> PL[planner]
-    PL --> EX[ExecutorStart/Run]
-    EX --> PT[printtup → 客户端]
+    PSP --> IP["★ F2 InitPostgres → authenticate"]
+    IP --> ENG["★ F3 InitParserEngine / InitExecutorEngine"]
+    ENG --> PMN[PostgresMain]
+    PMN --> RC["★ F4 ReadCommand"]
+    RC --> PC["★ F5 process_command COM 预处理"]
+    PC --> ESQ[exec_simple_query]
+    ESQ --> RP["★ F6 raw_parser"]
+    RP --> PA["★ F7 parse_analyze / transformStmt"]
+    PA --> PL["★ F7 planner"]
+    PL --> EX["★ F8 ExecutorStart/Run"]
+    EX --> PT["★ F9 printtup → 客户端"]
 ```
 
 | 阶段 | PG14 关键符号 | 文件 |
@@ -86,7 +88,7 @@ flowchart TB
 | 解析 | `raw_parser` → `base_yyparse` | `parser.c` / `gram.y` |
 | 回包 | `printtup` / `EndCommand` | `printtup.c` / `postgres.c` |
 
-**OpenHalo 设计原则**：MySQL 路径**不替代** `PostgresMain` 主循环；`mainFunc` 内部仍调用 `PostgresMain`（`adapter.c:805–807`）。差异通过 `ProtocolInterface` 虚表与引擎 `*Routine` 在 ★ 点注入。
+**OpenHalo 设计原则**：MySQL 路径**不替代** `PostgresMain` 主循环；`mainFunc` 内部仍调用 `PostgresMain`（`adapter.c:805–807`）。差异通过 `ProtocolInterface` 虚表与引擎 `*Routine` 在 **★ F1–F9** 注入（上图各节点标注；§1–§9 逐点展开）。
 
 ---
 
