@@ -55,7 +55,7 @@ mysql.port = 3306
 PostgreSQL 14 处理一条客户端 SQL 的**时间顺序**如下。OpenHalo 在标有 ★ 的环节插入分叉，其余大量复用 PG 存储、事务、锁、WAL。
 
 ```mermaid
-flowchart LR
+flowchart TB
     C[客户端] --> PM[PostmasterMain]
     PM --> L[StreamServerPort 填 ListenSocket]
     L --> SL[ServerLoop]
