@@ -858,7 +858,7 @@ openHalo-1.0-beta1/src/
 | 文档 | 用途 |
 |------|------|
 | [openhalo-pg14-increment-analysis.md](openhalo-pg14-increment-analysis.md) | 618 diff 全文、符号索引 |
-| [pg16-mysql-phase1-dual-listen-plan.md](pg16-mysql-phase1-dual-listen-plan.md) | F1 移植：ConnCreate 分发 |
+| [pg16-mysql-port-execution-plan.md](pg16-mysql-port-execution-plan.md) §1 | F1 移植：ConnCreate 分发、按步执行 |
 | [pg16-guc-three-way-comparison.md](pg16-guc-three-way-comparison.md) | GUC 三向对比 |
 | [pg16-nodes-three-way-comparison.md](pg16-nodes-three-way-comparison.md) | NodeTag 移植策略 |
 | [mysql-protocol-port-plan.md](mysql-protocol-port-plan.md) | UDB-TX 协议 MR 清单 |
