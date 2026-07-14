@@ -21,7 +21,7 @@
 | 想了解什么 | 读哪个 |
 |-----------|--------|
 | AI 全景入门 + LLM 机制 + AI Infra 工种 + 各地区岗位 | **本文**（你正在读） |
-| AI 发展史 1956-2026 | [ai_timeline.md](ai_timeline.md) |
+| AI 发展史 1956-2026 | [ai-timeline.md](ai-timeline.md) |
 | 执行计划：Step 0→4 怎么做 | [ai-infra-project-plan.md](ai-infra-project-plan.md) |
 
 **本文各章阅读建议：**
@@ -188,7 +188,7 @@ Cursor 客户端展示（内联补全 / Chat 面板）
 
 你说的「接数据库查答案再回答」更接近 **RAG**（检索增强生成）——这是大模型时代弥补模型局限（知识过时、可能幻觉）的增强方式，不是 AI 的基础原理。
 
-> 深入讨论（规则系统 vs 学习系统对比、RAG 三段类比）见 [ai_timeline.md §1.3](ai_timeline.md)。
+> 深入讨论（规则系统 vs 学习系统对比、RAG 三段类比）见 [ai-timeline.md §1.3](ai-timeline.md)。
 
 ---
 
@@ -715,7 +715,7 @@ LLM 推理的一个关键矛盾（详见 §2.4）：
 
 **2025-2026 国内企业趋势：vLLM + SGLang 协同部署。** 不再"二选一"，而是 vLLM 做生产基座（扛并发、管 KV Cache、PagedAttention 防 OOM），SGLang 做智能编排（JSON Schema 强制输出、复杂 Agent 流程编排）。实测数据：协同方案 JSON 格式错误率 0.2%（纯 vLLM 17.3%），显存抖动 OOM 风险由 vLLM 兜底。
 
-> **一个影响行业的事件：DeepSeek。** 2025 年初 DeepSeek-R1 的发布改变了行业认知——证明了架构创新（MLA、MoE）和训练方法创新（GRPO）可以显著缩小与前沿模型的资源差距。今天 AI 竞争从「单纯拼 GPU 数量」转向「资源 + 算法 + 工程 + 生态」的综合竞争。详细分析见 [ai_timeline.md §4.2](ai_timeline.md)。
+> **一个影响行业的事件：DeepSeek。** 2025 年初 DeepSeek-R1 的发布改变了行业认知——证明了架构创新（MLA、MoE）和训练方法创新（GRPO）可以显著缩小与前沿模型的资源差距。今天 AI 竞争从「单纯拼 GPU 数量」转向「资源 + 算法 + 工程 + 生态」的综合竞争。详细分析见 [ai-timeline.md §4.2](ai-timeline.md)。
 
 **选型参考：** 追求稳定 → vLLM；追求极致性能/结构化输出 → SGLang；国内企业推荐 vLLM + SGLang 协同；本地开发/个人体验 → Ollama（~120k stars，但不支持 Continuous Batching 和多 GPU 张量并行，不适合生产）。
 
@@ -765,7 +765,7 @@ LLM 推理的一个关键矛盾（详见 §2.4）：
 | 指标 | 数据 |
 |------|------|
 | GitHub Stars | **~21,100** |
-| 最新版本 | v1.27.1（2025.7；2026 年中仍活跃维护） |
+| 最新版本 | v1.27.0（2026.6） |
 | 年增长 | ~16%（慢于 vLLM/SGLang，但稳步增长） |
 | 贡献者 | 727 |
 
@@ -817,7 +817,7 @@ LLM 推理的一个关键矛盾（详见 §2.4）：
 按这个顺序：
 
 1. **先读完本文**——建立 AI 全景认知 + LLM 内部机制 + AI Infra 工种理解
-2. **再读 [ai_timeline.md](ai_timeline.md)**——理解 AI 怎么发展到今天的、5 个深层技术问题
+2. **再读 [ai-timeline.md](ai-timeline.md)**——理解 AI 怎么发展到今天的、5 个深层技术问题
 3. **最后看 [ai-infra-project-plan.md](ai-infra-project-plan.md)**——动手做项目（Step 0→4）
 
 **核心建议：**
@@ -873,12 +873,12 @@ LLM 推理的一个关键矛盾（详见 §2.4）：
 | SGLang 30k stars, 1.02 亿周下载 | [Socket](https://socket.dev/pypi/package/sglang) | 2026 |
 | FastAPI 99.5k stars, 38% 采用率 | [Programming Helper](https://www.programming-helper.com/tech/fastapi-2026-python-api-framework-ai-ml-adoption-enterprise) | 2026 |
 | K8s 82% 生产使用, 66% GenAI | [CNCF 博客](https://www.cncf.io/blog/2026/03/05/the-great-migration-why-every-ai-platform-is-converging-on-kubernetes/) | 2026.3 |
-| ONNX Runtime 21.1k stars, v1.27.1 | [Snyk](https://security.snyk.io/package/pip/onnxruntime) | 2026 |
+| ONNX Runtime 21.1k stars, v1.27.0 | [Snyk](https://security.snyk.io/package/pip/onnxruntime) | 2026 |
 | ONNX + KleidiAI 2.4× 提速 | [ONNX Runtime 博客](https://onnxruntime.ai/blogs/arm-microsoft-kleidiai) | 2025.5 |
 | ONNX vs PyTorch 延迟降 27.6% | IEEE 基准研究 | 2026 |
 | TGI 归档 | 社区报告 | 2026 |
 | SLM 92.48% 下载量, Router 模式 | [SLM in Production 2026](https://dev.to/alexcloudstar/small-language-models-in-production-2026-where-slms-beat-frontier-models-and-where-they-quietly-3kn5) | 2026 |
-| RAG 市场 $19 亿, CAGR 35-48% | MarketResearch, MarketsandMarkets | 2025 |
+| RAG 市场 $19 亿, CAGR 35-48% | MarketResearch, MarketsandMarkets（注：不同机构估算差异大，仅供参考） | 2025 |
 | 深圳 AI Infra 薪资 ¥18,680/月 | 猎聘 (6,409 样本) | 2025-2026 |
 | 大模型岗位占 AI 招聘 45%, 增长 12× | Boss 直聘, 脉脉, CSDN | 2026 |
 | vLLM+SGLang 协同部署成国内主流 | [CSDN](https://devpress.csdn.net/amd/6a38e5c310ee7a33f280bbe9.html), 阿里云, 百度百舸 | 2026 |
