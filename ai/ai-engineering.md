@@ -4,7 +4,7 @@
 
 ---
 
-## 0. 本文定位
+## 本文定位
 
 这份文档写给**只用过 AI 工具、但不知道背后发生了什么**的普通开发者。
 
@@ -20,9 +20,13 @@
 
 | 想了解什么 | 读哪个 |
 |-----------|--------|
-| AI 全景入门 + LLM 机制 + AI Infra 工种 + 各地区岗位 | **本文**（你正在读） |
-| AI 发展史 1956-2026 | [ai-timeline.md](ai-timeline.md) |
+| AI 工程实践：LLM 机制 + AI Infra 工种 + 技术栈数据 + 学习路径 | **本文**（你正在读） |
+| AI 概览入门：认知框架 + 发展史 1956-2026 + 5 个关键问题 | [ai-intro.md](ai-intro.md) |
 | 执行计划：Step 0→4 怎么做 | [ai-infra-project-plan.md](ai-infra-project-plan.md) |
+
+**建议阅读顺序：** 先读 [ai-intro.md](ai-intro.md) 建立全局认知（1-2 小时）→ 再读本文深入工程细节（1-2 小时）→ 最后看项目计划动手。
+
+**全文阅读时间：约 75-90 分钟（可按需跳过 §5 数据章节）。**
 
 **本文各章阅读建议：**
 - §1「AI 工具底层」— 必读，建立感性认知（15 分钟）
@@ -129,16 +133,12 @@ Cursor 客户端展示（内联补全 / Chat 面板）
 
 #### 一张表看清三条链路
 
-```
-┌──────────────┬───────────────────┬───────────────────┬───────────────────┐
-│              │  ChatGPT 网页版    │  OpenCode           │  Cursor             │
-├──────────────┼───────────────────┼───────────────────┼───────────────────┤
-│ AI Infra 在哪 │ 全在 OpenAI 机房   │ 远程（API 提供商） │ 远程（API 提供商）  │
-│ 你本地跑什么  │ 浏览器             │ CLI + 工具链         │ IDE + 代码索引      │
-│ 你碰 AI Infra │ 完全不碰            │ 完全不碰            │ 完全不碰             │
-│ 开发商        │ 做推理 + 做产品    │ 做产品，调别人推理  │ 做产品，调别人推理   │
-└──────────────┴───────────────────┴───────────────────┴───────────────────┘
-```
+| | **ChatGPT 网页版** | **OpenCode** | **Cursor** |
+|---|---|---|---|
+| **AI Infra 在哪** | 全在 OpenAI 机房 | 远程（API 提供商） | 远程（API 提供商） |
+| **使用者本地跑什么** | 浏览器 | CLI + 工具链 | IDE + 代码索引 |
+| **使用者接触 AI Infra 吗** | 完全不碰 | 完全不碰 | 完全不碰 |
+| **开发商角色** | 做推理 + 做产品 | 做产品，调别人推理 | 做产品，调别人推理 |
 
 理解这张表就不会被招聘 JD 上的称呼搞混：
 - 做 OpenCode / Cursor 这类工具的 → 「AI 应用开发」
@@ -188,15 +188,19 @@ Cursor 客户端展示（内联补全 / Chat 面板）
 
 你说的「接数据库查答案再回答」更接近 **RAG**（检索增强生成）——这是大模型时代弥补模型局限（知识过时、可能幻觉）的增强方式，不是 AI 的基础原理。
 
-> 深入讨论（规则系统 vs 学习系统对比、RAG 三段类比）见 [ai-timeline.md §1.3](ai-timeline.md)。
+> 规则系统的知识在 if-else 里，学习系统的知识在模型参数中——这是 AI 与经典编程的根本区别。详见 [ai-intro.md §1.3](ai-intro.md)。
 
 ---
 
 ## 2. LLM 内部如何工作
 
+> 上一章追踪了一条消息从浏览器到推理服务器的完整旅程，其中提到了分词（Tokenize）、推理计算、KV Cache、解码等环节。这一章拆开每个环节，看具体是怎么算的。本章是全文最难的部分，会引入约 30 个新术语，涉及矩阵乘法和形状追踪。如果你第一次接触，建议先快速扫一遍建立印象（15 分钟），不要卡在某个公式上——读完 §3-§6 后回来看会有新理解。如果完全不关心数学细节，看 [ai-intro.md §1.4](ai-intro.md) 的纯文字版即可。
+>
+> **读完本章你能回答什么？** 为什么大模型回答越长越贵？KV Cache 为什么是系统瓶颈？为什么同样是 LLM，有的擅长写代码有的擅长聊天？——这些都是 AI Infra 面试的核心问题。
+>
 > 这一章从「我喜欢吃红烧肉」这一句话出发，追踪它如何变成 token、如何在 Attention 中让每个字互相"看到"、如何在 FFN 中被深度加工、如何在 Prefill 中一次过完全部层、如何在 Decode 中一个字一个字蹦出来。
 >
-> 不要求数学背景——只需要理解"矩阵乘法 = 对应乘再求和"这个基本操作。每一步都标明形状变化，关键是建立直觉。
+> 不要求数学背景——只需要理解"矩阵乘法 = 对应乘再求和"这个基本操作。每一步都标明形状变化。
 
 ### 2.1 分词 → 向量 → 位置
 
@@ -228,11 +232,13 @@ Cursor 客户端展示（内联补全 / Chat 面板）
 
 Attention 的完整计算分六步。全程输入 X[4×d]，输出形状不变 [4×d]——但每个向量已经融合了上下文。
 
+> **先理解一个关键概念：权重矩阵。** 后面你会看到 WQ、WK、WV、WO 这些字母——它们是训练阶段学出来的数字矩阵（§2.6 会讲怎么训练的）。你现在可以把每个 W 理解为一套「映射规则」：输入一个向量，输出另一个向量，不同的 W 代表不同的映射角度。不需要知道矩阵里的具体数字，只需要知道它们存在、而且所有 token 共享同一套 W。
+
 ---
 
 **第 1 步：三组投影。** `X[4×d] × WQ/WK/WV[d×d] → Q[4×d], K[4×d], V[4×d]`
 
-WQ、WK、WV 是三个训练学出来的权重矩阵。把同一个输入投影到三个不同的"视角"：
+把同一个输入 X 分别乘以三个不同的权重矩阵，得到三个不同的"视角"：把同一个输入投影到三个不同的"视角"：
 
 | | 角色 | 类比 |
 |---|---|---|
@@ -513,7 +519,7 @@ DeepSeek-R1 用的方法。用数学题答案、代码运行结果等**可验证
 | 问题 | 具体表现 |
 |------|---------|
 | **太贵** | GPU 昂贵，长上下文吃显存，用户量上来成本飙升 |
-| **太慢** | 响应延迟高，高并发排队严重，尾延迟（P95/P99）波动大 |
+| **太慢** | 响应延迟高，高并发排队严重，尾延迟（P95/P99——95%/99% 用户的最差响应时间）波动大 |
 | **难运维** | 出问题不易定位，日志不统一，升级回滚风险大 |
 | **需要接企业数据** | 企业资料不在模型里，需要 RAG、权限控制、知识库更新 |
 | **需要接工具** | 不只是回答，还要读文件、查数据库、调 API、执行工作流 |
@@ -576,7 +582,7 @@ LLM 推理的一个关键矛盾（详见 §2.4）：
 | **C++** | 🟡 加分 | GPU kernel、推理框架底层开发 |
 | **国产芯片适配** | 🟡 加分 | 昆仑芯/昇腾/海光，vLLM-Kunlun Plugin 等 |
 
-**薪资数据（深圳，猎聘 6,409 样本）：**
+**薪资数据（深圳，猎聘 6,409 样本，数据采集 2025 Q3-2026 Q1）：**
 
 | 经验级别 | 月薪范围 |
 |---------|---------|
@@ -585,7 +591,8 @@ LLM 推理的一个关键矛盾（详见 §2.4）：
 | **3-5 年** | **~¥24,200** |
 | 5 年以上 | ~¥26,700 |
 | 全行业均值 | **¥18,680** |
-| AI Infra 工程师（含推理优化） | **月均 ¥75,800**（全行业均值） |
+| 薪资分布 | **20K-30K 占比最高（25%）**，15K-30K 合计占 46% |
+| AI Infra 工程师（细分岗位，含推理优化） | **月均 ¥75,800**（注：样本量小，主要为资深岗，不代表入门薪资） |
 
 **岗位热度：**
 - 2026 年 AI 岗位同比增长 **~12 倍**
@@ -600,8 +607,10 @@ LLM 推理的一个关键矛盾（详见 §2.4）：
 - AI 平台研发 / MLOps / LLM 服务化工程师
 - Python 后端开发（AI 方向）/ RAG 开发工程师 / AI 应用开发工程师
 
-不要搜的：
-- AI 算法工程师 / 深度学习工程师 / 大模型训练工程师 / 数据标注工程师
+如果你搜到以下岗位，注意它们不是 AI Infra 方向：
+- **AI 算法工程师 / 深度学习工程师** — 偏模型设计和训练，不是工程化方向
+- **大模型训练工程师** — 需要 GPU 集群调度经验，不适合入门
+- **数据标注工程师** — 不同的工种，不涉及模型部署和推理
 
 > **数据来源：** 猎聘薪资统计、脉脉《2025-2026 人才市场洞察报告》、Boss 直聘 2025 薪资报告、CSDN 行业分析、掘金社区 JD 调研
 
@@ -681,7 +690,7 @@ LLM 推理的一个关键矛盾（详见 §2.4）：
 
 | 指标 | 数据 |
 |------|------|
-| GitHub Stars | **~162,500**（全局排名 #48） |
+| GitHub Stars | **~170,000+**（截至 2026.7 实际已远超 v5 发布时的 162k；全局排名 #48） |
 | PyPI 月下载量 | **~1.67 亿次** |
 | 累计安装 | **超 12 亿次** |
 | 日 pip 安装量 | **>300 万/天**（v5 发布后增长 150×） |
@@ -694,30 +703,32 @@ LLM 推理的一个关键矛盾（详见 §2.4）：
 
 **证据来源：** [HF 官方博客 (2025.12)](https://huggingface.co/blog/transformers-v5)、[Star History](https://www.star-history.com/huggingface/transformers/)、pypistats.org
 
-### 5.2 推理引擎：vLLM vs SGLang
+### 5.2 推理框架：vLLM vs SGLang
+
+> 注：vLLM/SGLang 按 §1.4 五零件分类属于"推理框架"（引擎 + KV Cache 管理 + 调度 + 多卡并行）。但行业日常交流中常直接叫"推理引擎"，两者混用是普遍现象，本文 §5 沿用行业习惯但以"框架"为准。
 
 | | vLLM | SGLang |
 |------|------|------|
-| GitHub Stars | **~85,000** | **~30,200** |
+| GitHub Stars | **~86,200**（截至 2026.7） | **~30,200** |
 | Forks | 18,700+ | 7,100+ |
 | 贡献者 | 2,000+ | — |
 | 部署 GPU 数 | **400,000+** | — |
 | PyPI 周下载 | — | **~1.02 亿次** |
-| 最新版本 | v0.25.0（2025.7） | v0.5.13.post1 |
+| 最新版本 | 持续活跃更新 | v0.5.13.post1 |
 | 组织归属 | PyTorch Foundation（2025.5 起） | PyTorch Ecosystem（2025.3 起） |
 | 生产用户 | Meta, Mistral, Cohere, Google, IBM, Databricks, Cloudflare | xAI（Grok）, NVIDIA, LinkedIn, Cursor |
 | 核心优势 | 最稳定、社区最大、KV Cache 分页管理 | RadixAttention（多轮对话快 10-20%）、前缀缓存 |
 | 性能参考 | Llama-70B 1,000-2,000 tok/s（A100） | DeepSeek V3 上比 vLLM 快 3.1× |
 
-> **vLLM PagedAttention 演进说明：** v0.25.0 中旧版 PagedAttention CUDA kernel 已被移除，改用 FlashAttention + Triton。KV Cache 分页管理的**概念保留**在 V1/MRv2 新架构中——换的是实现引擎，不是设计思想。文档中"PagedAttention"指代这一设计理念。
+> **vLLM PagedAttention 演进说明：** KV Cache 分页管理的**设计理念保留**在新架构中——换的是实现引擎（FlashAttention + Triton 替代旧版 CUDA kernel），不是设计思想。文档中"PagedAttention"指代这一设计理念。
 
 **HuggingFace TGI（Text Generation Inference）已于 2025.12.11 进入维护模式、2026.3.21 归档只读**，自托管 LLM 服务市场正式进入 vLLM vs SGLang 双雄时代。
 
 **2025-2026 国内企业趋势：vLLM + SGLang 协同部署。** 不再"二选一"，而是 vLLM 做生产基座（扛并发、管 KV Cache、PagedAttention 防 OOM），SGLang 做智能编排（JSON Schema 强制输出、复杂 Agent 流程编排）。实测数据：协同方案 JSON 格式错误率 0.2%（纯 vLLM 17.3%），显存抖动 OOM 风险由 vLLM 兜底。
 
-> **一个影响行业的事件：DeepSeek。** 2025 年初 DeepSeek-R1 的发布改变了行业认知——证明了架构创新（MLA、MoE）和训练方法创新（GRPO）可以显著缩小与前沿模型的资源差距。今天 AI 竞争从「单纯拼 GPU 数量」转向「资源 + 算法 + 工程 + 生态」的综合竞争。详细分析见 [ai-timeline.md §4.2](ai-timeline.md)。
+> **一个影响行业的事件：DeepSeek。** 2025 年初 DeepSeek-R1 的发布改变了行业认知——证明了架构创新（MLA、MoE）和训练方法创新（GRPO）可以显著缩小与前沿模型的资源差距。今天 AI 竞争从「单纯拼 GPU 数量」转向「资源 + 算法 + 工程 + 生态」的综合竞争。详细分析见 [ai-intro.md §4.2](ai-intro.md)。
 
-**选型参考：** 追求稳定 → vLLM；追求极致性能/结构化输出 → SGLang；国内企业推荐 vLLM + SGLang 协同；本地开发/个人体验 → Ollama（~120k stars，但不支持 Continuous Batching 和多 GPU 张量并行，不适合生产）。
+**选型参考：** 追求稳定 → vLLM；追求极致性能/结构化输出 → SGLang；国内企业推荐 vLLM + SGLang 协同；本地开发/个人体验 → Ollama（~174,000+ stars，但不支持 Continuous Batching 和多 GPU 张量并行，不适合生产）。
 
 **证据来源：** [AI Wiki - vLLM](https://aiwiki.ai/wiki/vllm)、[Socket - sglang](https://socket.dev/pypi/package/sglang)、[EVAL #001: 推理引擎对比](https://buttondown.com/ultradune/archive/eval-001-the-great-llm-inference-engine-showdown)、[开源 LLM 推理引擎对比 2026](https://fish.audio/zh-CN/blog/open-source-llm-inference-engines-2026/)、[vLLM+SGLang 协同部署实战](https://devpress.csdn.net/amd/6a38e5c310ee7a33f280bbe9.html)
 
@@ -745,7 +756,7 @@ LLM 推理的一个关键矛盾（详见 §2.4）：
 | 指标 | 数据 |
 |------|------|
 | K8s 生产使用率 | **82%** 的容器用户 |
-| GenAI 推理在 K8s 上 | **66%** 的企业 |
+| GenAI 推理在 K8s 上 | **66%** 的企业（CNCF 2025 调查，样本量有限；不同调查数据有差异） |
 | 数据工作负载在 K8s 上 | **~50%** 的企业 |
 
 **关键趋势：** CNCF 社区已启动 K8s「AI 一致性」计划，定义运行 AI 工作负载的基线能力。vLLM 和 SGLang 成为 K8s 上高吞吐 LLM 服务的标准组件。KEDA（基于请求队列的自动缩放）正在成为推理服务的标配。
@@ -785,7 +796,7 @@ LLM 推理的一个关键矛盾（详见 §2.4）：
 | **不适合** | 高并发生产服务（应配合 vLLM） | 模型实验和快速迭代 |
 | **关系** | 模型的"源格式" | 模型的"部署格式" |
 
-**一句话：HF Transformers 做实验和加载，vLLM/SGLang 做 GPU 生产服务，ONNX Runtime 做跨平台/边端/CPU 部署优化——三个不是竞争关系，是一个流水线上的不同阶段。**
+**一句话：HF Transformers 做实验和加载，vLLM/SGLang 做 GPU 生产服务，ONNX Runtime 做跨平台/CPU/边缘设备部署——三个不是竞争，是同一个模型在不同场景下的不同用法。**
 
 **证据来源：** [Snyk - onnxruntime](https://security.snyk.io/package/pip/onnxruntime)、[Arm + KleidiAI (2025.5)](https://onnxruntime.ai/blogs/arm-microsoft-kleidiai)、[ONNX Runtime GenAI](https://developer.baidu.com/article/detail.html?id=7322579)、IEEE 基准研究 (2026)、[optimum-benchmark](https://github.com/huggingface/optimum-benchmark)
 
@@ -817,7 +828,7 @@ LLM 推理的一个关键矛盾（详见 §2.4）：
 按这个顺序：
 
 1. **先读完本文**——建立 AI 全景认知 + LLM 内部机制 + AI Infra 工种理解
-2. **再读 [ai-timeline.md](ai-timeline.md)**——理解 AI 怎么发展到今天的、5 个深层技术问题
+2. **再读 [ai-intro.md](ai-intro.md)**——理解 AI 怎么发展到今天的、5 个深层技术问题
 3. **最后看 [ai-infra-project-plan.md](ai-infra-project-plan.md)**——动手做项目（Step 0→4）
 
 **核心建议：**
@@ -829,7 +840,8 @@ LLM 推理的一个关键矛盾（详见 §2.4）：
 **项目路径选择：**
 
 **路径 A：Python + HF Transformers（LLM 应用工程主流，国内岗位最多）**
-- 用 HF Transformers（162k stars）加载 Qwen/Llama/DeepSeek 模型，跑 benchmark
+- **第一天就能做**：打开 Google Colab，`pip install transformers`，加载 `Qwen/Qwen2.5-0.5B-Instruct`，输入一句中文看输出——不到 10 行代码，不需要 GPU
+- 用 HF Transformers（~170k+ stars）加载 Qwen/Llama/DeepSeek 模型，跑 benchmark
 - 用 FastAPI 封装成 OpenAI 兼容流式服务
 - 适合：AI 平台后端、LLM 服务化、大模型应用工程方向
 - 对应 [ai-infra-project-plan.md](ai-infra-project-plan.md) 的 Step 1→2 路线
@@ -868,17 +880,18 @@ LLM 推理的一个关键矛盾（详见 §2.4）：
 
 | 数据 | 来源 | 时间 |
 |------|------|------|
-| HF Transformers 162k stars, v5 日 300 万下载 | [HF 官方博客](https://huggingface.co/blog/transformers-v5) | 2025.12 |
-| vLLM 85k stars, 40 万 GPU | [AI Wiki](https://aiwiki.ai/wiki/vllm) | 2026 中 |
-| SGLang 30k stars, 1.02 亿周下载 | [Socket](https://socket.dev/pypi/package/sglang) | 2026 |
+| HF Transformers 170k+ stars, v5 日 300 万下载 | [HF 官方博客](https://huggingface.co/blog/transformers-v5), Star History | 2025.12 / 2026.7 |
+| vLLM 86.2k stars, 40 万 GPU | [AI Wiki](https://aiwiki.ai/wiki/vllm), GitHub | 2026 中 |
+| SGLang 30.2k stars, 1.02 亿周下载 | [Socket](https://socket.dev/pypi/package/sglang) | 2026 |
 | FastAPI 99.5k stars, 38% 采用率 | [Programming Helper](https://www.programming-helper.com/tech/fastapi-2026-python-api-framework-ai-ml-adoption-enterprise) | 2026 |
-| K8s 82% 生产使用, 66% GenAI | [CNCF 博客](https://www.cncf.io/blog/2026/03/05/the-great-migration-why-every-ai-platform-is-converging-on-kubernetes/) | 2026.3 |
+| K8s 82% 生产使用, 66% GenAI（注：样本量有限，不同调查有差异） | [CNCF 博客](https://www.cncf.io/blog/2026/03/05/the-great-migration-why-every-ai-platform-is-converging-on-kubernetes/) | 2026.3 |
 | ONNX Runtime 21.1k stars, v1.27.0 | [Snyk](https://security.snyk.io/package/pip/onnxruntime) | 2026 |
+| Ollama 174k+ stars | GitHub, 多方交叉验证 | 2026.6 |
 | ONNX + KleidiAI 2.4× 提速 | [ONNX Runtime 博客](https://onnxruntime.ai/blogs/arm-microsoft-kleidiai) | 2025.5 |
 | ONNX vs PyTorch 延迟降 27.6% | IEEE 基准研究 | 2026 |
 | TGI 归档 | 社区报告 | 2026 |
 | SLM 92.48% 下载量, Router 模式 | [SLM in Production 2026](https://dev.to/alexcloudstar/small-language-models-in-production-2026-where-slms-beat-frontier-models-and-where-they-quietly-3kn5) | 2026 |
-| RAG 市场 $19 亿, CAGR 35-48% | MarketResearch, MarketsandMarkets（注：不同机构估算差异大，仅供参考） | 2025 |
+| RAG 市场规模 | MarketResearch, MarketsandMarkets（注：不同机构估算差异极大，从几亿到几十亿美元不等，任一单一数据不可采信） | 2025 |
 | 深圳 AI Infra 薪资 ¥18,680/月 | 猎聘 (6,409 样本) | 2025-2026 |
 | 大模型岗位占 AI 招聘 45%, 增长 12× | Boss 直聘, 脉脉, CSDN | 2026 |
 | vLLM+SGLang 协同部署成国内主流 | [CSDN](https://devpress.csdn.net/amd/6a38e5c310ee7a33f280bbe9.html), 阿里云, 百度百舸 | 2026 |
