@@ -1,6 +1,6 @@
 # FDW 规划期回调走读（以 postgres_fdw 为例）
 
-> **范围**：只讲 **规划期**（`Query` → `PlannedStmt`）。执行期见 [§9](#9-执行期回调速查)。  
+> **范围**：只讲 **规划期**（`Query` → `PlannedStmt`），执行期见 [§9](#9-执行期回调速查)。  
 > **前置**：Analyzer/Rewriter 已产出带 **`rtable` + `jointree`** 的 `Query`（主线见 `sql_pipeline_faq.md` §2–§4、§5）。  
 > **代码块**：上方 **源码**：`path:行号` 便于跳转；片段为节选。
 
@@ -19,21 +19,21 @@
 9. [执行期回调速查](#9-执行期回调速查)
 10. [参考索引](#10-参考索引)
 
-**阅读路线**：§1 → §2（示例 SQL + §2.1～2.4 主线递进 + §2.5 FDW 插入点 + §2.6～2.10 源码）→ §5 外表两条 SQL → §6 查表。
+**阅读建议**：§1 → §2（示例 SQL + §2.1～2.4 主线递进 + §2.5 FDW 插入点 + §2.6～2.10 源码）→ §5 外表两条 SQL → §6 查表。
 
 ---
 
 ## 1. 规划器入口：带着什么进 `planner()`
 
-TCOP 在分析、重写之后调用 `pg_plan_query` → `planner()`（`postgres.c:899` → `planner.c:333`）。此时交给规划器的 **不是 SQL 字符串**，而是 **`Query` 树**（`rtable`、`jointree`、聚合/排序/limit 等字段；`commandType` 区分 SELECT/DML/UTILITY）。
+经过分析和重写后，TCOP 调用 `pg_plan_query` → `planner()`（`postgres.c:899` → `planner.c:333`）。此时交给规划器的是 **`Query` 树**（`rtable`、`jointree`、聚合/排序/limit 等字段；`commandType` 区分 SELECT/DML/UTILITY）。
 
-规划器 **不再** 解析表名绑定 catalog——那是 Analyzer 的职责。规划器在 `Query` 上 **改树（预处理）**，在 **`query_planner()`** 阶段才为参与扫描的来源建立 **`RelOptInfo` 与 `pathlist`**，最后在 **`create_plan()`** 产出 **`Plan`**。§2 用与 `sql_pipeline_faq.md` 相同的一条 GROUP BY 示例 SQL，按 **Query → 预处理 → Path → Plan** 递进说明；外表与 FDW 回调见 §2.5 及 §2.6～2.10。
+规划器 **不再** 解析表名绑定 catalog。那是 Analyzer 的职责。规划器在 `Query` 上 **改树（预处理）**，在 **`query_planner()`** 阶段才为参与扫描的来源建立 **`RelOptInfo` 与 `pathlist`**，最后在 **`create_plan()`** 产出 **`Plan`**。§2 用与 `sql_pipeline_faq.md` 相同的一条 GROUP BY 示例 SQL，按 **Query → 预处理 → Path → Plan** 递进说明；外表与 FDW 回调见 §2.5 及 §2.6～2.10。
 
 ---
 
-## 2. `planner()` 主线拆解 —— 一条 SQL 逐步演变
+## 2. `planner()` 主线拆解，一条 SQL 逐步演变
 
-下文与 `sql_pipeline_faq.md` 使用同一条 GROUP BY 示例 SQL。外表与 FDW 回调的插入点见 §2.5，源码走读见 §2.6～2.10。
+下文使用与 `sql_pipeline_faq.md` 相同的 GROUP BY 示例 SQL。外表与 FDW 回调的插入点见 §2.5，源码走读见 §2.6～2.10。
 
 ```sql
 SELECT u.id, u.name, count(o.id) AS paid_orders
@@ -47,7 +47,7 @@ ORDER BY paid_orders DESC
 LIMIT 10;
 ```
 
-**叙述顺序**：§2.1～2.4 沿 `planner()` 调用链展开——(1) Rewriter 之后的 `Query`；(2) `subquery_planner` 等对 `Query` 的预处理；(3) `query_planner()` 为 `jointree` 中的来源建立 `RelOptInfo` 并生成 `Path`；(4) `create_plan()` 将选中的 `Path` 转为 `Plan`。各结构在首次出现的阶段再说明，文首不设 `Query` 与 `RelOptInfo` 的对照表。`Query` 在 Analyzer 中的构造见 `sql_pipeline_faq.md` §3、§5.6。
+§2.1～2.4 沿 `planner()` 调用链展开，依次覆盖 (1) Rewriter 之后的 `Query`；(2) `subquery_planner` 等对 `Query` 的预处理；(3) `query_planner()` 为 `jointree` 中的来源建立 `RelOptInfo` 并生成 `Path`；(4) `create_plan()` 将选中的 `Path` 转为 `Plan`。各结构在首次出现的阶段再展开说明，文首不设 `Query` 与 `RelOptInfo` 的对照表。`Query` 在 Analyzer 中的构造见 `sql_pipeline_faq.md` §3、§5.6。
 
 ---
 
@@ -55,7 +55,7 @@ LIMIT 10;
 
 Rewriter 对本例通常不改树。进入 `planner()` 时，规划器面对的是 **语义化的 `Query` 节点**，核心字段如下。
 
-**`rtable`（range table，不是 SQL 里的「一张表」）**  
+**`rtable`（range table，不是 SQL 里的"一张表"）**  
 是一个列表，`List`，元素为 **`RangeTblEntry`（RTE）**：本次查询登记的所有范围来源（基表、视图展开、CTE、子查询、JOIN 结果伪表等），带 `relid`、别名等。字段名 **`rtable`** 表示 range table 列表；没有名为 `RTABLE` 的独立节点类型。
 
 **`jointree`**  
@@ -94,7 +94,7 @@ Query
 
 ### 2.2 规划预处理：`subquery_planner` 与 `PlannerInfo`
 
-`standard_planner()`（`planner.c:351`）调用 **`subquery_planner()`**（`planner.c:775`）。入口处创建 **`PlannerInfo *root`**（`planner.c:790`）：**当前这一层 `Query` 的规划上下文**，`root->parse` 指向待规划的 `Query`，并预留 `simple_rel_array`、`upper_rels` 等。
+`standard_planner()`（`planner.c:351`）调用 **`subquery_planner()`**（`planner.c:775`）。入口处创建 **`PlannerInfo *root`**（`planner.c:790`），代表**当前这一层 `Query` 的规划上下文**。`root->parse` 指向待规划的 `Query`，并预留 `simple_rel_array`、`upper_rels` 等。
 
 在约 **866～1368 行**，`subquery_planner` **只改写 `Query`**（`rtable`、`jointree`、表达式），**不**调用 `build_simple_rel`，因而此阶段一般还没有基表上的 **`pathlist`**。对本例：
 
@@ -108,7 +108,7 @@ Query
 
 ### 2.3 从 `Query` 到 `Path`：`grouping_planner` 与 `query_planner`
 
-`subquery_planner` 在 **1373 行** 调用 **`grouping_planner()`**（`planner.c:1775`），开始 **代价驱动的 Path 搜索**。此时工作对象从「改 `Query`」转为「在 **`RelOptInfo` 上挂候选 `Path`**」。
+`subquery_planner` 在 **1373 行** 调用 **`grouping_planner()`**（`planner.c:1775`），开始 **代价驱动的 Path 搜索**。此时工作重心从"改 `Query`"转到"在 **`RelOptInfo` 上挂候选 `Path`**"。
 
 **`RelOptInfo` 与 `pathlist`**  
 每个 **参与本次扫描或连接的逻辑关系**（基表、连接结果、上层 GROUP/SORT 等）对应一个 `RelOptInfo`；其 **`pathlist`** 存放多种实现该关系的候选 Path（顺序扫描、索引扫描、`ForeignPath`、Hash Join 等）及代价。
@@ -122,7 +122,7 @@ Query
 2. **`get_relation_info`**（`plancat.c:121`）：基表统计、索引；若 `RELKIND_FOREIGN_TABLE` 则设置 **`rel->fdwroutine`**（尚未 `GetForeignRelSize`）。
 3. **`deconstruct_jointree`** + **`make_one_rel`**（`allpaths.c:297`）：拆分 restrict、枚举 JOIN 顺序、生成基表与 join Path。
 
-`query_planner` 返回的 **`current_rel`** 表示 join + WHERE 之后的逻辑结果（本例：LEFT JOIN 且 `u.active` 已作为 restrict）。随后在同一 `grouping_planner` 内自下而上叠上层 Path：**`create_grouping_paths`**（GROUP/HAVING）→ **`create_ordered_paths`**（ORDER）→ **`create_limit_path`**（LIMIT，挂到 `UPPERREL_FINAL`）。本例无窗口，**`create_window_paths`** 跳过。
+`query_planner` 返回的 **`current_rel`** 表示 join + WHERE 之后的逻辑结果（本例：LEFT JOIN 且 `u.active` 已作为 restrict）。随后在同一 `grouping_planner` 内自下而上一层层叠加上层 Path：**`create_grouping_paths`**（GROUP/HAVING）→ **`create_ordered_paths`**（ORDER）→ **`create_limit_path`**（LIMIT，挂到 `UPPERREL_FINAL`）。本例无窗口，**`create_window_paths`** 跳过。
 
 `grouping_planner` 返回后，`subquery_planner` 内 **`set_cheapest`**（1395）、**`return root`**（1397），`PlannerInfo` 的 `upper_rels[FINAL]` 上已有最便宜的上层 Path。
 
@@ -167,7 +167,7 @@ standard_planner @351
 
 ---
 
-### 2.6 `standard_planner`：先规划 Path，再生成 Plan
+### 2.6 `standard_planner`，先规划 Path 再生成 Plan
 
 `planner()` 进入 `standard_planner()`（`planner.c:351`）后，对顶层语句依次做两件事：
 
@@ -205,17 +205,19 @@ standard_planner @351
 
 ---
 
-### 2.8 `grouping_planner`：在预处理后的 `Query` 上造 Path
+### 2.8 `grouping_planner`，在预处理后的 `Query` 上造 Path
 
-`subquery_planner` 在 **1373 行** 调用 `grouping_planner`（定义在 `planner.c:1775`）。调用返回后，同一函数内 **`set_cheapest`**（1395）、**`return root`**（1397），才把 `PlannerInfo` 交回 `standard_planner`。
+`subquery_planner` 在 **1373 行** 调用 `grouping_planner`（定义在 `planner.c:1775`）。调用返回后，同一函数内依次执行 **`set_cheapest`**（1395）、**`return root`**（1397），再把 `PlannerInfo` 交回 `standard_planner`。
 
 ```c
 	grouping_planner(root, tuple_fraction, setops);     /* planner.c:1373 */
 ```
 
-`grouping_planner` 内部按 SQL 语义自下而上叠 Path：**scan/join → GROUP/窗口 → ORDER → LIMIT**，DML 再挂 **`ModifyTablePath`**。本例：`users`⨝`orders` → `create_grouping_paths`（`count` + HAVING）→ `create_ordered_paths` → `create_limit_path`（与 §2.3 一致）。
+`grouping_planner` 内部按 SQL 语义自下而上一层层叠加 Path：**scan/join → GROUP/窗口 → ORDER → LIMIT**，DML 再挂 **`ModifyTablePath`**。本例：`users`⨝`orders` → `create_grouping_paths`（`count` + HAVING）→ `create_ordered_paths` → `create_limit_path`（与 §2.3 一致）。
 
-#### 2.8.1 目标列与 DML：`preprocess_targetlist`
+---
+
+#### 2.8.1 目标列与 DML，`preprocess_targetlist`
 
 `grouping_planner` 里较早的一步（`planner.c:1908`）：
 
@@ -247,19 +249,21 @@ preprocess_targetlist()           preptlist.c:66
 **`appendinfo.c` 何时调 FDW**（`appendinfo.c:985-996`）：
 
 ```c
-	else if (relkind == RELKIND_FOREIGN_TABLE)
-	{
-		fdwroutine = GetFdwRoutineForRelation(target_relation, false);
-		if (fdwroutine->AddForeignUpdateTargets != NULL)
-			fdwroutine->AddForeignUpdateTargets(root, rtindex,
-												target_rte, target_relation);
+		else if (relkind == RELKIND_FOREIGN_TABLE)
+		{
+			fdwroutine = GetFdwRoutineForRelation(target_relation, false);
+			if (fdwroutine->AddForeignUpdateTargets != NULL)
+				fdwroutine->AddForeignUpdateTargets(root, rtindex,
+													target_rte, target_relation);
 ```
 
 对 **UPDATE/DELETE/MERGE 的目标外表**，在 `processed_tlist` 中追加 **junk 列**（如远程 `ctid`、整行 `Var`），供 `ModifyTable` 定位待修改行。
 
 纯 **`SELECT`** 走 `preprocess_targetlist`，通常不进 `add_row_identity_columns`，因而不会调 `AddForeignUpdateTargets`。
 
-#### 2.8.2 scan/join：`query_planner()`
+---
+
+#### 2.8.2 scan/join，`query_planner()`
 
 注释写明这一段对应 **FROM/WHERE**（`planner.c:1988-1995`）：
 
@@ -267,8 +271,10 @@ preprocess_targetlist()           preptlist.c:66
 		current_rel = query_planner(root, standard_qp_callback, &qp_extra);
 ```
 
-返回值 `current_rel` 表示 **join + where 之后** 的逻辑结果（本例：`u.active` 与 JOIN ON 已作为 restrict），上面挂多种候选 **Path**。  
+返回值 `current_rel` 表示 **join + where 之后** 的逻辑结果（本例：`u.active` 与 JOIN ON 已作为 restrict），上面挂着多种候选 **Path**。  
 **`RelOptInfo`、`build_simple_rel`、外表 `GetForeignRelSize` / `GetForeignPaths`** 都在 `query_planner` 内部完成，见 §2.9；只为 **`jointree` 里的 `RangeTblRef(1)`、`(2)`** 建基表 rel，不为未引用的 rtable 项建 rel。
+
+---
 
 #### 2.8.3 GROUP / ORDER / LIMIT / DML
 
@@ -282,23 +288,23 @@ preprocess_targetlist()           preptlist.c:66
 
 ---
 
-### 2.9 `query_planner` 内部：从 `jointree` 到外表 Path
+### 2.9 `query_planner` 内部，从 `jointree` 到外表 Path
 
 **入口**：`planmain.c:54` 的 `query_planner()`。
 
 #### （1）`jointree` 与 `rtable` 的分工
 
-主线说明见 **§2.3**。此处补典型边界：**纯 `INSERT INTO ft VALUES (...)`** 的目标表可在 `rtable` 中但不在 `jointree` 当扫描源 → 不 `build_simple_rel` → 通常不调 `GetForeignRelSize`；视图展开等遗留 RTE 同理。本例只为 `jointree` 中的 `RangeTblRef(1)`、`(2)` 建基表 rel。
+主线说明见 **§2.3**。此处补典型边界：**纯 `INSERT INTO ft VALUES (...)`** 的目标表可在 `rtable` 中但不在 `jointree` 当扫描源 → 不 `build_simple_rel` → 通常不调 `GetForeignRelSize`；视图展开等遗留 RTE 同理。
 
 **源码**：`planmain.c:168-173` + `add_base_rels_to_query`（`initsplan.c:163-186`）。
 
 #### （2）`add_base_rels_to_query` → `build_simple_rel`
 
-**做什么**：
+该函数做三件事：
 
 1. **递归遍历 `jointree`**（`FromExpr` / `JoinExpr` / `RangeTblRef`）。
 2. 每遇到一个 **`RangeTblRef(n)`**，调用 **`build_simple_rel(root, n)`**（`relnode.c:212`）。
-3. `build_simple_rel` 为 **`rtable` 第 n 项** 创建一个空的 **`RelOptInfo`**（`pathlist`  initially 空、`fdwroutine` 先 NULL）。
+3. `build_simple_rel` 为 **`rtable` 第 n 项** 创建一个空的 **`RelOptInfo`**（`pathlist` 初始为空、`fdwroutine` 先 NULL）。
 
 将 `rtable` 第 `n` 项对应的逻辑关系实例化为可供路径生成的 **`RelOptInfo`**。
 
@@ -321,7 +327,7 @@ preprocess_targetlist()           preptlist.c:66
 
 ---
 
-### 2.10 `create_plan`：Path → Plan（含 FDW）
+### 2.10 `create_plan`，从 Path 到 Plan（含 FDW）
 
 `subquery_planner` 返回后，`standard_planner` 选出 **`best_path`**（`planner.c:542`），**`create_plan`**（`544`）：
 
@@ -346,7 +352,7 @@ preprocess_targetlist()           preptlist.c:66
 
 ---
 
-## 4. 何时因「外表」分叉
+## 4. 何时因"外表"分叉
 
 ### 4.1 没有 `RTE_FOREIGN`
 
@@ -369,7 +375,7 @@ preprocess_targetlist()           preptlist.c:66
 
 ---
 
-## 5. SQL 走通：回调顺序
+## 5. SQL 走通，回调顺序
 
 外表 `ft`，已 `CREATE EXTENSION postgres_fdw`。
 

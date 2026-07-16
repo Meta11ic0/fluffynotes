@@ -1,12 +1,12 @@
 # 从零开始搭建一个 FDW
 
-本文以 `test_fdw` 为例，先让 `test_fdw` 能被创建、能触发 validator、能走完最基础扫描回调链路。
+本文以 `test_fdw` 为例，目标是让 `test_fdw` 能被创建、能触发 validator、能走完最基础的扫描回调链路。
 
 ---
 
 ## 1. 先明确最小目标
 
-一个最小 FDW（只支持最基础 `SELECT` 扫描）需要三块：
+一个最小 FDW（只支持最基础 `SELECT` 扫描）需要三部分：
 
 1. `handler`（必须）：返回 `FdwRoutine *`
 2. `validator`（建议）：校验并打印 options
@@ -19,11 +19,11 @@
   - `ReScanForeignScan`
   - `EndForeignScan`
 
-### 1.1 与业务 SQL、规划器名词的对照（读后续章节前可先扫一眼）
+### 1.1 业务 SQL 与规划器名词的对照
 
-从**业务 SQL**看，你在 `FROM` 里写的 **外表（`FOREIGN TABLE`）** 就是一张**逻辑上的表**：对**使用者**（凡是要写 SQL 的人：应用开发、分析脚本、运维等）而言，可以像普通表一样写 `SELECT ... WHERE ... JOIN ...`（具体能否下推、能否 join 取决于 FDW 能力）。**FDW** 则是“这类表背后的访问协议与实现”：由 `CREATE FOREIGN DATA WRAPPER` 注册，`SERVER` / `USER MAPPING` / 表级 `OPTIONS` 提供连接与行为参数。
+从**业务 SQL** 看，`FROM` 子句里的**外表（`FOREIGN TABLE`）**就是一张**逻辑上的表**。凡是要写 SQL 的人（应用开发、分析脚本、运维等），都能像普通表一样写 `SELECT ... WHERE ... JOIN ...`（具体能否下推、能否 join 取决于 FDW 能力）。**FDW** 则是这类表背后的访问协议与实现，由 `CREATE FOREIGN DATA WRAPPER` 注册，`SERVER` / `USER MAPPING` / 表级 `OPTIONS` 提供连接与行为参数。
 
-从**规划器/执行器内核**看，后文会出现的类型可以一句话对齐为：
+从**规划器/执行器内核**看，后文出现的类型可以一句话对齐为：
 
 
 | 名词                     | 白话含义                                                                                 |
@@ -34,13 +34,13 @@
 | `ForeignScanState`     | **执行期状态**：对应正在跑的 `ForeignScan` 计划，`fdw_state` 给 FDW 挂私有数据。                           |
 
 
-对应关系可记：**规划阶段**在 `RelOptInfo` 向 `pathlist` 注册候选 `Path`（通常使用 `add_path`），选中后再落成 **`ForeignScan` 计划**；**执行阶段**用 **`ForeignScanState`** 驱动 `Begin/Iterate/.../End` 回调。
+**规划阶段**在 `RelOptInfo` 向 `pathlist` 注册候选 `Path`（通常使用 `add_path`），选中后再落成 **`ForeignScan` 计划**。**执行阶段**则用 **`ForeignScanState`** 驱动 `Begin/Iterate/.../End` 回调。
 
 ---
 
 ## 2. 最小代码骨架
 
-下面骨架在 **handler、各扫描回调**里加入了最基础的 `ereport(NOTICE, …)`，方便第一次跑通时**对照调用顺序**、确认规划/执行链路是否走到预期。**实际开发中通常不需要**这些打印：功能稳定后应去掉或改为受控的诊断开关，避免客户端/日志噪音与无谓开销（`Iterate` 路径上尤其不要常驻大段 `NOTICE`）。
+下面骨架在 **handler、各扫描回调**里加入了最基础的 `ereport(NOTICE, …)`，方便第一次跑通时对照调用顺序，确认规划/执行链路是否走到预期位置。**实际开发中通常不需要**这些打印。功能稳定后应去掉或改为受控的诊断开关，避免客户端/日志噪音与无谓开销（`Iterate` 路径上尤其不要常驻大段 `NOTICE`）。
 
 ```c
 #include "postgres.h"            /* Datum, PG_FUNCTION_ARGS, PG_RETURN_*, ereport/errmsg */
@@ -197,23 +197,23 @@ LANGUAGE C STRICT;
 SELECT add_one(41);  -- 42
 ```
 
-这个例子说明了 PG 的函数模型分两层：
+这个例子说明 PG 的函数模型分两层：
 
 - C 层：统一写成 `Datum func(PG_FUNCTION_ARGS)`，通过 `PG_GETARG_*`/`PG_RETURN_*` 取参与返回
 - SQL 层：声明参数类型、返回类型、语言和符号映射
 
-理解了 `add_one`，再看 FDW 的 `handler`/`validator` 就很自然了：它们也是 V1 函数，只是调用方通常是内核而不是业务 SQL。
+理解了 `add_one` 再看 FDW 的 `handler`/`validator`：它们也是 V1 函数，只是调用方通常是内核而不是业务 SQL。
 
 ### 3.2 handler 和 validator 的调用方式
 
-写 FDW 时，你会看到这样两个入口：
+写 FDW 时，两个入口如下：
 
 ```c
 Datum test_fdw_handler(PG_FUNCTION_ARGS)
 Datum test_fdw_validator(PG_FUNCTION_ARGS)
 ```
 
-它们通常不是给用户主动 `SELECT` 的，而是由服务端内核通过 fmgr（ Function Manager，PostgreSQL 的函数调用管理器，负责按系统目录元数据定位函数符号并完成统一调用）在特定时机调用。下面是实际代码证据：
+它们通常由服务端内核通过 fmgr（Function Manager，PostgreSQL 的函数调用管理器，负责按系统目录元数据定位函数符号并完成统一调用）在特定时机调用。下面看内核中的调用代码：
 
 `handler` 的调用路径（`src/backend/foreign/foreign.c`）：
 
@@ -248,7 +248,7 @@ if (OidIsValid(fdwvalidator))
 }
 ```
 
-所以结论是：`handler`、`validator` 虽然不是典型业务函数，但它们依旧是 fmgr 调用的 C 函数入口。
+`handler`、`validator` 虽然不是典型业务函数，但它们依旧是 fmgr 调用的 C 函数入口。
 
 用户就算强行 `SELECT test_fdw_handler()`，返回也是 `fdw_handler` 这种内部伪类型（本质是内部指针封装），没有业务语义。
 
@@ -289,7 +289,7 @@ ERROR: incompatible library "...test_fdw.so": missing magic block
 
 ### 3.4 什么是 V1 调用约定，哪些函数需要声明为 V1
 
-PostgreSQL 目前只支持一种 C 函数调用约定，称为 Version-1，所有需要被 fmgr 调用的动态库函数都必须遵守。声明方式是在函数定义之前写：
+PostgreSQL 目前只支持一种 C 函数调用约定，称为 Version-1，所有经 fmgr 调用的动态库函数都必须遵守。声明方式是在函数定义之前写：
 
 ```c
 PG_FUNCTION_INFO_V1(funcname);
@@ -311,7 +311,7 @@ CppConcat(pg_finfo_,funcname) (void) \
 ```
 
 1. 宏展开会生成对外导出声明：`extern PGDLLEXPORT Datum funcname(PG_FUNCTION_ARGS);`，供动态链接器找到符号。
-2. **生成 `pg_finfo_funcname()` 查询函数**：返回 `{ 1 }` 这个结构，告诉 fmgr "我是 V1 约定"。fmgr 在加载符号时会先调用 `pg_finfo_funcname()` 确认调用版本，再按 V1 方式调用。
+2. **生成 `pg_finfo_funcname()` 查询函数**：返回 `{ 1 }` 这个结构，告诉 fmgr "此为 V1 约定"。fmgr 在加载符号时会先调用 `pg_finfo_funcname()` 确认调用版本，再按 V1 方式调用。
 
 **哪些函数需要 V1？**
 
@@ -342,7 +342,7 @@ PG_FUNCTION_INFO_V1(test_fdw_validator);
 
 ### 3.5 V1 函数的真实 C 签名：宏展开后是什么
 
-你看到的：
+宏展开后为：
 
 ```c
 Datum test_fdw_validator(PG_FUNCTION_ARGS)
@@ -428,7 +428,7 @@ PG_RETURN_POINTER(fdwroutine);
 
 `Datum`（`uintptr_t`）是 PG 的万能容器，足够大，既能装整数值（`int32`、`bool` 等按值传递类型），也能装指针地址（`text *`、`FdwRoutine *` 等引用类型）。V1 统一 ABI 靠它做通道，类型安全则靠宏在两端做转换。
 
-**`PG_FUNCTION_ARGS`** 在不同函数里看起来相同，但参数内容不同，也是同一道理：宏本身只展开为 `FunctionCallInfo fcinfo`，而 `FunctionCallInfo` 本质是一个指针类型，指向 `FunctionCallInfoBaseData`。它的定义（相对路径：`src/include/fmgr.h`）是：
+**`PG_FUNCTION_ARGS`** 在不同函数里看起来相同，但参数内容不同。宏本身只展开为 `FunctionCallInfo fcinfo`，而 `FunctionCallInfo` 本质是一个指针类型，指向 `FunctionCallInfoBaseData`。它的定义（相对路径：`src/include/fmgr.h`）是：
 
 ```c
 #define PG_FUNCTION_ARGS    FunctionCallInfo fcinfo
@@ -446,7 +446,7 @@ typedef struct FunctionCallInfoBaseData
 } FunctionCallInfoBaseData;
 ```
 
-这说明“同一个函数签名”只是 ABI 统一；真正的参数个数和值都在 `fcinfo->nargs` 与 `fcinfo->args[]` 里，由 fmgr 按 `pg_proc` 注册信息在运行时填充，C 代码只负责按位置解包（`PG_GETARG_*`）。
+“同一个函数签名”只是 ABI 统一。真正的参数个数和值都在 `fcinfo->nargs` 与 `fcinfo->args[]` 里，由 fmgr 按 `pg_proc` 注册信息在运行时填充，C 代码只负责按位置解包（`PG_GETARG_*`）。
 
 ---
 
@@ -511,7 +511,7 @@ extern PGDLLIMPORT Node *newNodeMacroHolder;
 
 **为什么回调函数要写成 `static`？**
 
-`testGetForeignRelSize` 这类回调只在本文件内部被 handler 拿去填指针，不需要对外导出符号。写 `static` 有三个好处：
+`testGetForeignRelSize` 这类回调只在本文件内部被 handler 拿去填指针，不需要对外导出符号。写 `static` 的好处有三点：
 
 - 编译器不会为它生成导出符号，减小 `.so` 体积
 - 多个 FDW 在同一进程中可以有同名回调而不冲突
@@ -554,7 +554,7 @@ CREATE FOREIGN DATA WRAPPER test_fdw
 
 ### 4.3 validator 的入参从哪来：看内核调用点
 
-validator 在 SQL 层声明为 `(text[], oid)`，这两个参数从哪里传来？看内核实际调用处（`src/backend/commands/foreigncmds.c`）：
+validator 在 SQL 层声明为 `(text[], oid)`，这两个参数从哪来？看内核实际调用处（`src/backend/commands/foreigncmds.c`）的代码：
 
 ```c
 /* src/backend/commands/foreigncmds.c 第 192-202 行 */
@@ -570,12 +570,12 @@ if (OidIsValid(fdwvalidator))
 }
 ```
 
-两个参数的来源一目了然：
+两个参数的来源分别为：
 
 - **第 1 个参数 `valarg`（对应 `text[]`）**：当前对象上的所有 OPTIONS 经过 ADD/SET/DROP 操作合并后，序列化为 `text[]` 格式的 `Datum`。
 - **第 2 个参数 `ObjectIdGetDatum(catalogId)`（对应 `oid`）**：正在操作的系统目录 OID，例如 `ForeignDataWrapperRelationId`、`ForeignServerRelationId`、`UserMappingRelationId`、`ForeignTableRelationId`。validator 可以通过这个 OID 区分当前是在校验哪类对象的选项。
 
-这同一套 validator 会在 `CREATE/ALTER` 的四种对象时被调用，`catalogId` 就是区分它们的依据。
+同一套 validator 在 `CREATE/ALTER` 四类对象时都会被调用，`catalogId` 负责区分当前在操作哪一类。
 
 ---
 
@@ -605,7 +605,7 @@ test_fdw_validator(PG_FUNCTION_ARGS)
 }
 ```
 
-涉及的类型和函数逐一说明（下面都给实际源码证据）：
+下面逐个说明涉及的类型和函数，都附带实际源码定义：
 
 **`untransformRelOptions`**（声明：`src/include/access/reloptions.h`）
 
@@ -647,7 +647,7 @@ foreach(cell, options_list)        /* 遍历 list，cell 依次指向每个 List
 
 **DefElem**（`src/include/nodes/parsenodes.h`）
 
-每个 option 被表示为一个 `DefElem`，含键名和值：
+每个 option 用一个 `DefElem` 表示，含键名和值：
 
 ```c
 typedef struct DefElem
@@ -697,7 +697,7 @@ defGetString(DefElem *def)
 }
 ```
 
-1. 所以严格语义上，`defGetString(def)` 正常路径一般不会返回 `NULL`；代码里写 `val ? val : "<null>"` 更多是防御式写法，便于调试输出更稳健。
+1. `defGetString(def)` 正常路径一般不会返回 `NULL`。代码里写 `val ? val : "<null>"` 更多是防御式写法，让调试输出更稳健。
 
 **`defGetString`**（声明：`src/include/commands/defrem.h`）
 
@@ -705,11 +705,11 @@ defGetString(DefElem *def)
 extern char *defGetString(DefElem *def);
 ```
 
-将 `DefElem->arg` 中的值转换为 `char *`。支持的节点类型以 `define.c` 中 `defGetString` 的 `switch(nodeTag(def->arg))` 为准；不支持的类型会直接报错，不会静默返回。
+将 `DefElem->arg` 中的值转换为 `char *`。支持的节点类型见 `define.c` 中 `defGetString` 的 `switch(nodeTag(def->arg))`；不支持的类型会直接报错，不会静默返回。
 
 从 `DefElem` 提取内容的实践建议：
 
-- 键名：直接用 `def->defname`，但若你写的是防御型代码（特别是自定义 parser/构造节点场景），可加一次 `if (def == NULL || def->defname == NULL) ereport(ERROR, ...)`。
+- 键名：直接用 `def->defname`，但若编写的是防御型代码（特别是自定义 parser/构造节点场景），可加一次 `if (def == NULL || def->defname == NULL) ereport(ERROR, ...)`。
 - 值：优先用 `defGetString/defGetBoolean/defGetInt32/...` 这类 `defGet*`；不要直接解 `def->arg`。
 - 打印：调试日志可保留 `val ? val : "<null>"`，但要知道这通常不是“业务上常见分支”。
 
@@ -717,19 +717,19 @@ extern char *defGetString(DefElem *def);
 
 ## 5. 基础回调函数
 
-这一节回到最小骨架代码本身，逐个说明 7 个基础回调：**角色 → 签名 → 调用点 → 参数要点（含文档/源码依据）→ `test_fdw` 最小实现 → 小结**。与业务 SQL、规划器类型的对照见 **§1.1**。
+这一节回到最小骨架，逐个说明 7 个基础回调：**角色 → 签名 → 调用点 → 参数要点（含文档/源码依据）→ `test_fdw` 最小实现 → 小结**。与业务 SQL、规划器类型的对照见 **§1.1**。
 
-先说明术语：这里更准确的说法是 **FDW 回调函数（callback）**，而不是全局 hook。  
-它们是由 `handler` 返回的 `FdwRoutine` 结构体中的函数指针表，规划器和执行器在固定阶段按需调用。
+这里的正确说法是 **FDW 回调函数（callback）**，不是全局 hook。  
+它们由 `handler` 返回的 `FdwRoutine` 结构体中的函数指针表承载，规划器和执行器在固定阶段按需调用。
 
-对于本文的 `test_fdw`，目标不是实现真正的远端访问，而是做一个**最小可跑通骨架**：
+本文 `test_fdw` 的目标是实现一个**最小可跑通骨架**：
 
 - 规划阶段能正常返回一个最简单的 `ForeignScan Path/Plan`
 - 执行阶段能进入 FDW 回调链路
 - validator 能打印 options
 - 扫描阶段先返回空结果，便于调试调用顺序
 
-每个回调的说明都包含两层含义：
+每个回调的说明分两层：
 
 1. PostgreSQL 设计意图（文档/内核调用点）
 2. 本文最小骨架实现到什么程度
@@ -738,7 +738,7 @@ extern char *defGetString(DefElem *def);
 
 ### 5.1 `testGetForeignRelSize`
 
-**角色**：规划**早期**被调用，让 FDW 根据外表与约束修正**行数/宽度等估计**，供后续选路与成本使用。
+**角色**：规划**早期**调用，FDW 根据外表与约束修正**行数/宽度等估计**，供后续选路与成本使用。
 
 函数签名（`fdwapi.h`）：
 
@@ -780,7 +780,7 @@ testGetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid
 }
 ```
 
-**总结**：只写 `rows = 1` 是为让规划继续；真实 FDW 会读 options、远端统计或 `EXPLAIN` 等。依赖：`foreign/fdwapi.h`（签名与类型）。教学骨架刻意**不连远端**，只把 `baserel->rows` 设成常数即可把规划链跑通；而部分成熟的 FDW 在 `GetForeignRelSize` **内就会建立连接**，做的却不限于「估行」一条线。
+**总结**：只写 `rows = 1` 是为让规划继续；真实 FDW 会读 options、远端统计或 `EXPLAIN` 等。依赖 `foreign/fdwapi.h`（签名与类型）。教学骨架刻意**不连远端**，只把 `baserel->rows` 设成常数即可把规划链跑通。部分成熟的 FDW 在 `GetForeignRelSize` **内就会建立连接**，做的却不限于"估行"一条线。
 
 ---
 
@@ -833,7 +833,7 @@ ForeignPath *create_foreignscan_path(PlannerInfo *root, RelOptInfo *rel,
                                      List *fdw_private);
 ```
 
-**要点**：`NIL` 只适用于 **`List *`** 形参（此处为 `pathkeys`、`fdw_private`）；**`Path *` / `Relids`** 的空指针必须用 **`NULL`**，否则类型错误且可能在不同平台上引发告警或 ABI 问题。
+**要点**：`NIL` 只适用于 **`List *`** 形参（此处为 `pathkeys`、`fdw_private`）。**`Path *` / `Relids`** 的空指针必须用 **`NULL`**，否则类型错误且可能在不同平台上引发告警或 ABI 问题。
 
 **总结**：依赖 `optimizer/pathnode.h`（`add_path`、`create_foreignscan_path`）。真实 FDW 会算成本、多 path、`fdw_private` 等。
 
@@ -964,7 +964,7 @@ make_foreignscan(List *qptlist, List *qpqual, Index scanrelid,
 }
 ```
 
-总结：`GetForeignPlan` 在规划末期把已选 `ForeignPath` 落成 `ForeignScan`，并明确 quals 的远端/本地分工，同时封装执行期私有信息（`fdw_exprs`、`fdw_private`、`fdw_scan_tlist`、`fdw_recheck_quals`、`outer_plan`）。
+`GetForeignPlan` 在规划末期把已选 `ForeignPath` 落成 `ForeignScan`，明确 quals 的远端/本地分工，封装执行期私有信息（`fdw_exprs`、`fdw_private`、`fdw_scan_tlist`、`fdw_recheck_quals`、`outer_plan`）。
 
 #### 常见疑问：`InvalidOid`、多类 Path 回调、`scan_clauses`、`outer_plan`
 
@@ -980,7 +980,7 @@ make_foreignscan(List *qptlist, List *qpqual, Index scanrelid,
 
 **2) `best_path` 可能来自三类 Path 回调，是否表示会反复回调？**
 
-会多次回调，但按阶段，不是无意义循环：
+会多次回调，但按阶段划分，并非无意义循环：
 
 - 基表阶段：`GetForeignRelSize` -> `GetForeignPaths`
 - join 阶段：`GetForeignJoinPaths`（同一 joinrel 可能多次）
@@ -1179,7 +1179,7 @@ testEndForeignScan(ForeignScanState *node)
 
 ### 5.8 这 7 个回调与当前最小骨架的关系
 
-按执行顺序大致可以理解为：
+按执行顺序，这 7 个回调的职责是：
 
 1. `GetForeignRelSize`：先给规划器一个大小估计
 2. `GetForeignPaths`：再提供一个可选扫描路径
@@ -1189,15 +1189,15 @@ testEndForeignScan(ForeignScanState *node)
 6. `ReScanForeignScan`：需要重扫时重置状态
 7. `EndForeignScan`：结束时释放资源
 
-对于真正 FDW，这 7 个回调是“最小 SELECT 扫描链路”的核心。  
-对于本文 `test_fdw`，我们的目的只是做最小骨架验证，所以策略是：
+真实 FDW 的”最小 SELECT 扫描链路”核心就是这 7 个回调。  
+本文 `test_fdw` 只做最小骨架验证，策略是：
 
 - 规划阶段：只给最简单的 rows/path/plan
 - 执行阶段：只证明回调链路能进来
 - 返回结果：直接返回空 slot，不做真实远端访问
 - 调试方式：优先 `NOTICE` 打印，而不是一上来就实现真实扫描
 
-这也是为什么骨架中真正需要的头文件不多：
+这也是骨架需要的头文件较少的原因：
 
 - `foreign/fdwapi.h`：所有 FDW 回调签名与核心类型
 - `optimizer/pathnode.h`：`add_path`、`create_foreignscan_path`
@@ -1207,7 +1207,7 @@ testEndForeignScan(ForeignScanState *node)
 - `access/reloptions.h`：validator 解析 options
 - `commands/defrem.h`：validator 把 `DefElem` 的值转成字符串
 
-如果后续从“最小骨架”升级到“真实 FDW”，通常下一步要补的不是更多回调，而是：
+如果后续从”最小骨架”升级到”真实 FDW”，通常下一步要补充的是：
 
 - 读取 catalog / options
 - 设计 FDW 私有状态结构
@@ -1215,7 +1215,7 @@ testEndForeignScan(ForeignScanState *node)
 
 ## 官方参考
 
-下列链接以 **PostgreSQL 当前手册**（`/docs/current/`）为准；若本地有源码树，可同时对照 `doc/src/sgml/` 下同名 `.sgml`。
+下列链接基于 **PostgreSQL 当前手册**（`/docs/current/`）。若本地有源码树，可同时对照 `doc/src/sgml/` 下同名 `.sgml`。
 
 ### C 语言与 SQL 注册
 
