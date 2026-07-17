@@ -1,7 +1,7 @@
 # I/O 多路复用技术指南
 
-> **目标读者**：C 开发者，网络编程经验不多，正在学习 OpenHalo / PostgreSQL postmaster 的 `select` 监听模型。
-> **阅读建议**：先通读第 1–2 节建立整体认知，再按需跳读各 API 详解，最后看第 8 节与 PG 的关系。
+> 目标读者：有 C 基础、网络经验不多，正在看 OpenHalo / PostgreSQL postmaster 的 `select` 监听模型。
+> 建议：先读第 1–2 节，再按需查各 API，最后看第 10 节与 PG 的对照（含为何不用 epoll、为何无 accept 惊群）。
 
 ---
 
@@ -43,7 +43,7 @@ read(fd, buf, 1024);     // 从网络读数据，和读文件一样的 API
 close(fd);               // 关闭网络连接
 ```
 
-**关键认知**：在 Unix/Linux 里，网络连接和普通文件没有本质区别。两者都用**文件描述符**（fd）这个整数来指代，都用 `read`/`write`/`close` 操作。差别只在于文件的数据来自磁盘，网络 socket 的数据来自另一端的主机。
+在 Unix/Linux 里，socket 与普通文件一样，都用**文件描述符**（fd）指代，并共用 `read`/`write`/`close` 等接口。语义并不完全相同：普通文件在 `select`/`epoll` 上通常始终“可读/可写”；socket 的就绪与否取决于内核缓冲与连接状态。差别主要在数据从哪里来、何时算就绪，而不是“完全是另一种对象”。
 
 ### 1.2 网络连接的基础四步
 
@@ -56,27 +56,23 @@ listen(listen_fd, 5);                                // 3. 标记为监听状态
 int client_fd = accept(listen_fd, NULL, NULL);       // 4. 接受一个客户端连接
 ```
 
-#### 第一步：`socket` -- 创建一个端点
+#### 第一步：`socket` — 创建端点
 
-`socket()` 返回一个文件描述符。此时它只是一个**端点**，还没有绑定地址，也没有开始监听。可以想象成装了一台电话，但还没插电话线、也没拨号。
+`socket()` 返回一个文件描述符。此时尚未绑定地址，也未进入监听状态。
 
-#### 第二步：`bind` -- 告诉系统"在哪个端口等"
+#### 第二步：`bind` — 绑定本地地址
 
-把 socket 绑定到一个具体的地址和端口上（比如 `0.0.0.0:5432`）。这相当于把电话号码告诉电话局，现在别人可以通过这个号码找到了。
+把 socket 绑到具体地址和端口（例如 `0.0.0.0:5432`），之后客户端才能连到该端点。
 
-#### 第三步：`listen` -- 角色的转变
+#### 第三步：`listen` — 变为监听 socket
 
-`listen(fd, 5)` 是一个**关键节点**。
+`listen(fd, 5)` 把 socket 标成**被动（监听）socket**：只负责接收新连接，自身不再做普通数据读写。
 
-调用之前，这个 socket 只是一个普通的网络端点。调用之后，内核将它的角色改变为**监听 socket**。此后它只有一个职责：接收新连接。它自己不再参与数据读写。
+第二个参数 `5` 是 `backlog`。按 Linux `listen(2)`（查询日期 2026-07-17）：自 2.2 起，TCP 上它限制的是**已完成三次握手、等待 `accept` 取走**的队列长度（accept queue），并受 `/proc/sys/net/core/somaxconn` 封顶；未完成握手另有 SYN 相关限制（如 `tcp_max_syn_backlog`）。队列满时，客户端可能收到 `ECONNREFUSED`，或在支持重传的协议下请求被忽略以便稍后重试。不宜笼统写成「再排队或一律拒绝」。
 
-`listen` 的第二个参数 `5` 是 `backlog`，指定了**已完成连接队列**的最大长度。意思是：内核最多暂存 5 个已完成但尚未被 `accept` 取走的连接。超过 5 个时，后续连接要么排队、要么被拒绝。
+#### 第四步：`accept` — 取出一个已完成连接
 
-此后内核默默维护这个队列。每当有客户端完成连接建立，就自动放入队列，等待应用程序来取。
-
-#### 第四步：`accept` -- 从队列取一个
-
-`accept(listen_fd)` 的职责只有一件事：**从已完成连接队列里取出一个连接**，返回一个新的文件描述符。
+`accept(listen_fd)` **从已完成连接队列取出一个连接**，返回新的连接 fd。
 
 ```
                       ┌─────────────┐
@@ -90,8 +86,8 @@ int client_fd = accept(listen_fd, NULL, NULL);       // 4. 接受一个客户端
 
 | fd | 角色 | 生存期 |
 |----|------|--------|
-| `listen_fd`（监听 socket） | 只负责接客，永远不读写数据 | 服务器启动到关闭 |
-| `client_fd`（连接 socket） | 和**这一个**客户端对话，干活用的 | 从 `accept` 返回到 `close` |
+| `listen_fd`（监听 socket） | 只接受新连接，不读写业务数据 | 服务器启动到关闭 |
+| `client_fd`（连接 socket） | 与该客户端收发数据 | 从 `accept` 返回到 `close` |
 
 `listen_fd` 一直活着，持续接收新连接；每次 `accept` 返回的 `client_fd` 都是一个新的、独立的 fd。后续与客户端的所有数据交互，包括 `read`、`write`，都通过 `client_fd` 进行。
 
@@ -99,65 +95,35 @@ int client_fd = accept(listen_fd, NULL, NULL);       // 4. 接受一个客户端
 
 ### 1.3 阻塞 accept 与多连接困境
 
-#### "阻塞"到底是什么意思
+#### "阻塞"的含义
 
-调用 `accept(listen_fd)` 的时候，队列是空的怎么办？
+调用 `accept(listen_fd)` 时，若 accept 队列为空，进程在内核中挂起，直到有新连接完成或信号中断。这与在用户态空转（busy-wait）不同：阻塞等待期间进程不占 CPU。
 
-答案是进程**睡觉**。
+`read(fd, buf, len)` 同理：接收缓冲区无数据时阻塞；有数据时返回**实际读到的字节数**（可能小于 `len`，即**短读**）。
 
-这是操作系统级别的挂起（而非死循环轮询/忙等）。两者有本质区别：
+#### 单客户端：阻塞可接受
 
-```
-忙等（错误方式）：
-  while (队列为空) {
-      检查队列;          ← CPU 100%，什么都没干
-  }
-
-阻塞（实际方式）：
-  检查队列 → 为空 → 向内核报告"我没活干了，把我睡了吧"
-  → 内核将进程移出 CPU 运行队列
-  → CPU 去跑别的进程（或者空闲省电）
-  → 直到有新连接完成，内核唤醒进程，放回运行队列
-  → 进程被调度到 CPU 时，accept() 返回
-```
-
-**关键认知**：
-
-- **阻塞是默认行为**。无需设置任何 flag，`accept`/`read`/`write` 默认就阻塞。这是 Unix 的设计选择，目的就是让程序员用最简单的同步方式写代码。
-- **阻塞 ≠ 忙等**。阻塞时进程不消耗任何 CPU，这是操作系统提供的高效等待机制。忙等才是真问题：CPU 空转但什么都没做。
-- `read(fd, buf, len)` 的阻塞原理完全一样。内核 socket 接收缓冲区为空时进程睡眠，数据到达时唤醒。
-
-#### 单客户端：完全合理
-
-如果程序只服务一个客户端，整个生命周期就是一条直线：
+只服务一个客户端时，生命周期是一条直线：
 
 ```
-accept (睡到有连接) → read (睡到有数据) → 处理 → write → 回到 accept
+accept（等到连接）→ read（等到数据）→ 处理 → write → 回到 accept
 ```
 
-每一步阻塞都**完全合理**，反正除了这个客户端，没有别的事要做。让出 CPU 甚至是最优解。
+此时每步阻塞只占用这一个会话的进度，让出 CPU 往往合理。
 
-#### 多客户端：一个 read 卡死全部
+#### 多客户端：一个 read 卡住全部
 
-一旦要同时服务多个客户端，单线程阻塞模型就崩溃了：
-
-```
-时刻1：accept 返回了客户端 A 的 fd
-时刻2：read(fd_A, ...) 阻塞，等 A 发下一个字节
-时刻3：客户端 B 的连接已完成，静静躺在 accept queue 里
-       客户端 C 发来了数据，静静躺在内核接收缓冲区里
-       但服务器卡在 read(fd_A, ...) 上，什么都不知道
-```
-
-当服务器需要同时服务成百上千个客户端时：
+要同时服务多个客户端时，单线程阻塞模型就不行了：
 
 ```
-客户端 A 正在慢慢发数据（read 阻塞）
-客户端 B 已经连上但没人 accept
-客户端 C 的数据已在内核缓冲区，却没人 read
+时刻1：accept 返回客户端 A 的 fd
+时刻2：read(fd_A, ...) 阻塞，等待 A 的数据
+时刻3：客户端 B 已完成握手，停在 accept queue；
+       客户端 C 的数据已在内核接收缓冲；
+       进程仍卡在 read(fd_A, ...)，无法处理 B/C
 ```
 
-如果只有一个线程、一个连接套在一个 `read` 上，其他连接全部饿死。一个连接的慢 I/O 堵死了全局。
+单线程里若长期阻塞在某一个 `read` 上，其他已就绪的连接同样得不到调度：慢连接拖死整条事件路径。
 
 ### 1.4 三种经典解决思路（可并存）
 
@@ -180,7 +146,7 @@ FD_SET(listen_fd, &read_set);
 int nfds = listen_fd + 1;    // select 要求 nfds = 最大 fd + 1
 ```
 
-然后进入事件循环：
+然后进入事件循环（**伪代码**：省略错误处理；生产代码须检查返回值）：
 
 ```c
 for (;;) {
@@ -188,30 +154,25 @@ for (;;) {
     select(nfds, &rfds, NULL, NULL, NULL);
 
     for (int i = 0; i < nfds; i++) {
-        if (!FD_ISSET(i, &rfds)) continue;               // fd i 没就绪（位图中对应位为 0），跳过
+        if (!FD_ISSET(i, &rfds)) continue;
 
         if (i == listen_fd) {
-            /* listen_fd 就绪 → accept queue 里有新连接。
-               accept 拿到 client_fd，加入监视集合，
-               否则这个客户端后续发来的数据永远不会被 select 感知。 */
             int client = accept(listen_fd, NULL, NULL);
             FD_SET(client, &read_set);
-            if (client + 1 > nfds) nfds = client + 1;  // 新 fd 值更大时，更新 nfds
+            if (client + 1 > nfds) nfds = client + 1;
         } else {
-            /* 已连接的客户端 fd，默认是阻塞模式。
-               你调用 read(i, buf, 4) 要读 4 字节。
-               但客户端可能只发了 2 字节就卡住了，
-               read 会一直阻塞在这里等剩余 2 字节，
-               循环永远走不到下一个就绪 fd。 */
-            read(i, buf, 4);   // ← 阻塞！即使 select 说"可读"也会阻塞
+            /* 已连接 client_fd 若为阻塞模式：
+               select 只保证「至少 1 字节可读」，不保证 read(..., 4) 能读满 4 字节。
+               缓冲区不足时 read 会一直阻塞，循环无法处理其他就绪 fd。 */
+            read(i, buf, 4);
         }
     }
 }
 ```
 
-`FD_ISSET(fd, &rfds)` 只做一件事：检查 `select` 返回的位图里 fd 对应的位是否为 1。为 1 表示这个 fd **有数据可读**。
+`FD_ISSET(fd, &rfds)` 检查 `select` 返回位图中 fd 对应位是否为 1。
 
-**问题出在哪？** `select` 说"可读"只承诺**至少 1 字节**，不承诺需要的 4 字节已经全部到达。而阻塞 `read(fd, buf, 4)` 的语义是"不凑齐 4 字节绝不返回"。这两者之间存在 gap。一旦某个客户端发送不完整，整个事件循环就卡死在那个 `read` 上。
+**问题**：`select` 报告 client fd「可读」仅表示接收缓冲区**至少有 1 字节**；阻塞 `read(fd, buf, 4)` 在数据不足 4 字节时会**一直等待**，事件循环卡死在该 fd 上。
 
 **解决办法：把 client fd 设为非阻塞。** 位置在 `accept` 之后、加入监视之前：
 
@@ -221,16 +182,16 @@ fcntl(client, F_SETFL, O_NONBLOCK);   // 设成非阻塞
 FD_SET(client, &read_set);
 ```
 
-`listen_fd` 可以保持阻塞，`client_fd` 则必须设为非阻塞。两者待遇不同，根源在于 `select` 对它们的"可读"保证不一样：
+`listen_fd` 与 `client_fd` 待遇不同，因为“可读”含义不同：
 
-| fd 类型 | select 说"可读"的含义 | 后续调用 | 如果保持阻塞会怎样 |
-|---------|----------------------|----------|-------------------|
-| `listen_fd` | accept queue 里**一定有**已完成连接 | `accept` | 安全，队列非空，`accept` 立即返回 |
-| `client_fd` | 接收缓冲区有**至少 1 字节**数据 | `read` | 危险，需要 4 字节但可能只有 2 字节，`read` 死等 |
+| fd 类型 | select 说“可读”的含义 | 后续调用 | 若保持阻塞 |
+|---------|----------------------|----------|------------|
+| `listen_fd` | accept queue 非空（通常至少有一个已完成连接） | `accept` | 单进程独占该 listen fd 时，一般立即返回；见下方例外 |
+| `client_fd` | 接收缓冲至少有 1 字节（POSIX `read` 允许短读，见 [read(2)](https://man7.org/linux/man-pages/man2/read.2.html)、[POSIX read](https://pubs.opengroup.org/onlinepubs/9799919799.2024edition/functions/read.html)） | `read` | 请求长度大于当前可读字节时可能一直阻塞 |
 
-`listen_fd` 是安全的：只要 `select` 报告它可读，`accept` 一定不会阻塞。`client_fd` 则不同：`select` 只保证"能读"，不保证"读完所需长度"。
+例外（accept 竞争）：多个进程/线程共享同一 listen socket，并都在 `select`/`poll`/`epoll_wait` 上等待时，一个连接可能唤醒多个等待者，但只有一个 `accept` 能取到该连接，其余可能阻塞（阻塞 `accept`）或得到 `EAGAIN`（非阻塞）。这与“惊群”（thundering herd）相关；现代 Linux 对阻塞在 `accept` 上的等待者已有排他唤醒改进，但“多路复用监视同一 listen fd”仍可能惊群，可用 `EPOLLEXCLUSIVE`、`SO_REUSEPORT` 等缓解（见 [epoll(7)](https://man7.org/linux/man-pages/man7/epoll.7.html)、Cloudflare 等讨论）。PostgreSQL postmaster 是**单进程** `accept`，不落入此类竞争。
 
-设为非阻塞后，`read` 的行为变了。还是 `read(fd, buf, 4)`，还是要求 4 字节，但它**不再死等**：
+设为非阻塞后，`read` 不再为凑满请求长度而睡眠：
 
 ```c
 n = read(fd, buf, 4);
@@ -240,33 +201,25 @@ if (n < 0) {
         continue;
     }
 } else if (n > 0) {
-    /* n 可能是 1、2、3、4——有多少拿多少，绝不阻塞。
+    /* n 可能是 1、2、3、4；有多少拿多少，绝不阻塞。
        如果 n=2，说明客户端只发了 2 字节，后面可能还有。
-       你需要把已读的 2 字节存到应用层缓冲区（比如 conn->rbuf），
+       已读的 2 字节应存到应用层缓冲区（如 `conn->rbuf`），
        下次 select 说这个 fd 又可读时，接着读剩下的。 */
 }
 ```
 
-非阻塞 `read` 从不等人。有数据就给，少一点也行；没数据立刻返回 `EAGAIN`，把控制权还给事件循环。代价是需要在应用层自己维护**读到哪里了**的状态，每次能读多少读多少，攒够了再处理完整消息。
+非阻塞 `read`：有数据就返回（可短于请求长度）；无数据则返回 `-1` 且 `errno == EAGAIN`（或 `EWOULDBLOCK`），把控制权交回事件循环。应用层需自己维护已读进度，攒齐消息再处理。
 
-**总结**：
-
-| | 只用多路复用（阻塞 socket） | 多路复用 + 非阻塞 socket |
-|----|----|----|
-| `select` 说 fd 可读 | 知道有数据 | 知道有数据 |
-| 调用 `read` | 可能阻塞（数据不够就死等） | 拿多少算多少，没数据就 `EAGAIN`，绝不阻塞 |
-| 其他 fd | 被拖累，饿死 | 不受影响 |
-
-多路复用负责"该处理谁"，非阻塞 I/O 负责"处理时不卡住"，两者各管一半，缺一不可。
+多路复用决定“处理哪个 fd”，非阻塞 I/O 保证“处理时不把整条循环卡住”。二者配合才稳；仅多路复用而保留阻塞 client socket，慢连接仍会拖死循环。
 
 ---
 
-**关键认知**：多进程模型与 I/O 多路复用**不是互斥的**，它们解决**不同层面**的问题。
+多进程模型与 I/O 多路复用解决不同层面的问题，可以组合：
 
-- **I/O 多路复用**：回答"如何用一个线程知道**哪些 fd 现在可以读/写**？"
-- **多进程 per-connection**（PG 的 fork 模型）：回答"连接进来之后，**谁去跑完整的会话逻辑**？"
+- **I/O 多路复用**：一个线程如何知道哪些 fd 当前可读/可写
+- **多进程 per-connection**（PG 的 fork 模型）：连接建立后由谁跑完整会话逻辑
 
-PostgreSQL postmaster 正是两者结合。postmaster 用 `select` 监视少量监听 socket；一旦有新连接，**fork 一个 backend 子进程**专门服务该客户端，后续读写由子进程以阻塞方式处理，不再经过 postmaster 的多路复用。
+PostgreSQL postmaster 正是两者结合：用 `select` 监视少量监听 socket；有新连接则 **fork backend**，后续读写由子进程以阻塞方式处理，不再经过 postmaster 的多路复用。
 
 ```mermaid
 flowchart LR
@@ -303,12 +256,12 @@ flowchart LR
 
 | 阶段 | 年代/背景 | 没有新技术前怎么做 | 新技术解决什么 | 遗留问题 |
 |------|-----------|-------------------|----------------|----------|
-| **阻塞 + 多进程** | 早期 Unix | 主进程 `accept`，每连接 `fork` 子进程 | 简单可靠，隔离性好 | 进程重、C10K 困难 |
+| **阻塞 + 多进程** | 早期 Unix | 主进程 `accept`，每连接 `fork` 子进程 | 简单可靠，隔离性好 | 进程重；连接上万（常称 C10K）时难撑 |
 | **select** | 1983 BSD | 无法单线程监视多 fd；或只能轮询（busy-wait） | 内核一次返回多个就绪 fd | `FD_SETSIZE` 上限；fd_set 拷贝；O(n) 扫描 |
 | **poll** | SVR4（System V Release 4）/ POSIX | select 的 fd 上限与位图不便 | 用数组代替位图，无硬编码 1024 上限 | 仍 O(n) 扫描全部 pollfd |
 | **/dev/poll** | Solaris | 同 poll 的扩展性瓶颈 | Solaris 特有高性能接口 | 仅 Solaris；已较少使用 |
 | **kqueue** | FreeBSD 4.1 (2000) | poll 的 O(n) | 内核事件队列 + kevent，高效增删 | 主要 BSD/macOS |
-| **epoll** | Linux 2.5.45 (2002) | poll/select 在万级连接下 CPU 飙高 | O(1) 增删关注、仅返回就绪事件 | Linux 专用；ET 模式易踩坑 |
+| **epoll** | Linux 2.5.45 (2002) | poll/select 在万级连接下扫描成本高 | 关注集留在内核；`epoll_wait` 按就绪数收割；`epoll_ctl` 约 O(log n) | Linux 专用；ET 易踩坑 |
 | **IOCP** | Windows NT | select 在 WinSock 上语义与性能都差 | 完成端口模型，与 Windows 线程池深度集成 | Windows 专用；完成事件而非就绪事件 |
 | **io_uring** | Linux 5.1 (2019) | epoll 仍有一次次系统调用开销 | 共享环形队列批量提交/收割 I/O | 较新；API 与心智模型仍在演进 |
 
@@ -410,7 +363,7 @@ for (;;) {
 
 PG postmaster 的 `ServerLoop` 正是这个模式（用 `memcpy` 而非结构体赋值，见第 10 节）。
 
-> **拷贝问题的演进**：除 io_uring 外，所有多路复用每次调用都涉及内核与用户态之间的数据搬运，差别只在搬多少。select 和 poll 每次要拷贝**全量关注列表**（O(N)，N = 监视总数）。epoll/kqueue 靠"注册一次、反复等待"把关注列表留在内核，每次只拷回**就绪事件**（O(K)，K = 就绪数）。io_uring 用共享内存环形队列，彻底消除拷贝（见第 5、6、9 节）。
+> **拷贝问题的演进**：除 io_uring 外，多路复用每次调用都涉及内核与用户态之间的数据搬运，差别在搬多少。select/poll 每次拷贝**全量关注列表**（O(N)）。epoll/kqueue 注册一次后，每次只拷回**就绪事件**（O(K)）。io_uring 用共享环减少**控制面**拷贝；普通 `read`/`write` 的**数据面**仍常需拷贝，registered buffer / `SEND_ZC` 等才改变数据路径成本（见第 9 节）。
 
 #### （3）O(n) 扫描
 
@@ -487,15 +440,15 @@ for (;;) {
             nfds++;
         } else {
             char buf[4096];
-            n = read(fds[i].fd, buf, sizeof(buf));
-            if (n <= 0) {
+            int nr = read(fds[i].fd, buf, sizeof(buf));
+            if (nr <= 0) {
                 /* 连接关闭或出错：把最后一项移到当前位置，收缩数组 */
                 close(fds[i].fd);
                 fds[i] = fds[nfds - 1];
                 nfds--;
                 i--;              // 回退，检查刚移过来的项
             } else {
-                /* 处理读到的数据 */
+                /* 处理读到的数据（nr 可能短于 sizeof(buf)） */
             }
         }
     }
@@ -508,7 +461,7 @@ for (;;) {
 
 ## 5. epoll（Linux）
 
-> **适用**：Linux 2.6+，高并发网络服务的首选之一（Nginx、Redis、Node.js libuv 等在 Linux 上默认用它）。
+> **适用**：Linux 2.6+ 高并发网络服务常用。Nginx 在支持多种方法的平台上会自动选较高效者，Linux 上一般为 epoll（[官方 events 文档](https://nginx.org/en/docs/events.html)，查询日期 2026-07-17）。Redis 的 ae 事件库在 Linux 上走 `ae_epoll.c`（[源码](https://github.com/redis/redis/blob/unstable/src/ae_epoll.c)）。二者是否用 ET，见 5.3，勿混为一谈。
 
 ### 5.1 三个系统调用
 
@@ -524,16 +477,18 @@ int epoll_wait(int epfd, struct epoll_event *events,
 
 ### 5.2 内核数据结构（理解用，非调用必需）
 
-Linux 内核 epoll 实现（经典 2.6 设计）大致包含：
+Linux 内核 epoll 实现（经典设计，见 `fs/eventpoll.c`）大致包含：
 
 ```
 epoll 实例
-├── 红黑树：存所有被监视的 fd（O(log n) 增删）
-├── 就绪链表：当前可读的 fd 挂在这里
-└── 回调：当某 socket 收到数据，内核把对应 epitem 链到就绪链表
+├── 红黑树（interest list）：已注册 fd；epoll_ctl 增删改约 O(log n)
+├── 就绪链表（ready list）：当前有事件的 fd；回调挂链约 O(1)
+└── 等待队列：epoll_wait 阻塞时挂接的进程/线程
 ```
 
-另有 **eventfd** 等可纳入 epoll 监视，用于线程间唤醒（与网络 fd 统一事件源）。
+`epoll_wait` 从就绪链表收割事件，开销与**本次就绪数 k**相关（常见写法 O(k)），不随总监视数 n 线性扫描。`epoll_ctl` 走红黑树，为 O(log n)。热路径通常是 `epoll_wait`，不是反复 `epoll_ctl`。
+
+另有 **eventfd** 等可纳入 epoll，用于线程间唤醒（与网络 fd 统一事件源）。
 
 ### 5.3 水平触发（LT）与边缘触发（ET）
 
@@ -541,76 +496,70 @@ epoll 实例
 
 #### 两种模式对比
 
-| 模式 | 行为 | 类比 |
-|------|------|------|
-| **LT**（Level Trigger，默认） | 只要 fd 上仍有未读数据，每次 `epoll_wait` 都会报告 | 水龙头没关紧，一直滴水就一直提醒 |
-| **ET**（Edge Trigger） | 仅在状态**从未就绪 → 就绪**的边沿通知一次 | 门铃只响一次，必须一次拿完 |
+| 模式 | 行为 | 直观理解 |
+|------|------|----------|
+| **LT**（Level Triggered，默认） | 条件仍成立就会在后续 `epoll_wait` 中再次报告 | 缓冲里还有未读数据 → 还会通知 |
+| **ET**（Edge Triggered，`EPOLLET`） | 主要在状态从未就绪变为就绪时通知 | 边沿通知一次；未读尽则可能不再通知，直到再次出现边沿 |
 
-#### LT 是怎么工作的
+依据：[epoll(7)](https://man7.org/linux/man-pages/man7/epoll.7.html)（查询日期 2026-07-17）。LT 是默认；未指定 `EPOLLET` 时语义接近更快的 `poll`。
 
-LT 是默认模式，行为最接近 `select`/`poll`，没读完就反复通知，很宽容：
+#### LT
 
 ```c
-/* LT 模式：数据没读完，下次 epoll_wait 还会通知 */
-ev.events = EPOLLIN;                         // 默认就是 LT
+/* LT：数据未读完，下次 epoll_wait 通常仍会报告该 fd */
+ev.events = EPOLLIN;                         // 默认 LT
 epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &ev);
 
 /* epoll_wait 返回 fd 可读 */
-n = read(fd, buf, sizeof(buf));              // 只读了 100 字节
-/* 内核缓冲区还剩 200 字节没读。没关系——下次 epoll_wait 还会通知这个 fd。 */
+n = read(fd, buf, sizeof(buf));              // 例如只读了部分
+/* 内核缓冲若仍有数据，下次 epoll_wait 还会再报告 */
 ```
 
-好处是即使配了阻塞 socket，也不容易出致命 bug（1.4 节说的阻塞风险仍然存在，但在 LT 下不会丢事件）。代码写起来和 `select` 几乎一样，迁移成本低。
+即使配了阻塞 socket，也不容易因“漏事件”而永久饿死某 fd（1.4 节的阻塞 `read` 风险仍在：一次读请求过长仍可能卡住整条循环）。迁移自 `select`/`poll` 时改造成本较低。
 
-#### ET 是怎么工作的
+#### ET
 
-ET 只在数据**从无到有**的那一刻通知一次。之后不管读没读完，都不会再通知，除非有新数据到达：
+ET 在边沿通知；若一次没读尽，剩余字节仍留在内核缓冲（并未从连接上消失），但在没有新边沿前，`epoll_wait` 可能不再报告该 fd。应用若停在等待上，就会表现为「有数据却等不到事件」。man 页用 pipe 读写例子说明了这一点。
 
 ```c
-/* ET 模式：必须一次清空缓冲区，否则剩余数据永远压在缓冲区内 */
+/* ET：应用应读到 EAGAIN；未读尽时不会“丢字节”，但可能丢后续通知 */
 struct epoll_event ev;
 ev.events = EPOLLIN | EPOLLET;
 ev.data.fd = fd;
 epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &ev);
 
-/* epoll_wait 返回 fd 可读——只有这一次通知 */
+/* epoll_wait 返回可读后： */
 while (1) {
     n = read(fd, buf, sizeof(buf));
     if (n < 0) {
-        if (errno == EAGAIN) break;          // 缓冲区空了，读完
+        if (errno == EAGAIN) break;          // 当前已无更多可读
         /* 错误处理 */
     }
     if (n == 0) { /* EOF */ break; }
     /* 处理数据 */
 }
-/* 必须读到 EAGAIN 才停。如果提前退出循环，剩余数据就丢了。 */
+/* 提前退出循环：缓冲里可能还有数据，且在新边沿到来前不再通知 */
 ```
 
-两个硬性要求：
+硬性要求：
 
-1. fd **必须是非阻塞的**。ET 要求读到 `EAGAIN` 才停，但阻塞 fd 永远不返回 `EAGAIN`。读空缓冲区后下一次 `read` 会一直睡到有新数据到达为止，在这期间整个事件循环卡死。
-2. 必须循环 `read` 到 `EAGAIN`。提前退出意味着缓冲区里剩余的数据不会再触发通知（ET 只在"从无到有"时通知一次），数据就丢了。
+1. fd **必须非阻塞**。ET 依赖读到 `EAGAIN` 才停；阻塞 fd 在缓冲空时会睡死在 `read` 上，拖死事件循环。
+2. 应循环读到 `EAGAIN`（或错误/EOF）。提前退出不等于内核删数据，但等于自愿放弃下一次通知，直到对端再写入等新边沿。
 
-#### 什么时候用哪个
+#### 何时用哪个
 
-| 场景 | 推荐 | 原因 |
-|------|------|------|
-| 初学者、原型、工具脚本 | LT | 行为直观，写错了不会丢事件 |
-| fd 数量少（几十个以内） | LT | LT 多出来的 `epoll_wait` 返回次数开销可忽略 |
-| 高并发长连接服务器（Nginx、Redis） | ET | 每个连接只通知一次，`epoll_wait` 返回次数大幅减少，省 syscall |
-| 需要精确控制读写速率 | ET | 停止时机由代码控制，而非内核催促 |
-| 需要兼容 select/poll 迁移 | LT | 行为最接近，改造成本最低 |
+| 场景 | 常用选择 | 原因 |
+|------|----------|------|
+| 原型、工具、从 select/poll 迁移 | LT | 语义接近 poll，不易因漏读而饿死 |
+| fd 很少 | LT | 多几次 `epoll_wait` 返回通常可忽略 |
+| 高并发长连接、愿维护非阻塞状态机 | ET | 可减少重复就绪通知（须读到 `EAGAIN`） |
 
-**实际案例**：
-- **Nginx** -- 默认使用 ET。单个 worker 管理上万连接，LT 下 `epoll_wait` 会反复报告同一批未读完的 fd，syscall 开销不可接受
-- **Redis** -- 默认使用 ET。单线程事件循环 + 非阻塞 I/O，ET 的"一次通知读到尽"正好匹配其单线程模型
-- **libevent** -- 默认使用 LT。作为通用事件库，追求兼容性和易用性，LT 更不容易引发用户 bug
+**有源码依据的默认触发方式（勿外推为“业界惯例”）**（查询日期 2026-07-17）：
 
-高并发服务器青睐 epoll 的原因：
+- Redis `ae_epoll.c`：`epoll_ctl` 只或上 `EPOLLIN`/`EPOLLOUT`，**无 `EPOLLET`** → **LT**。
+- Nginx `ngx_epoll_module.c`：连接注册使用 `EPOLLIN|EPOLLOUT|EPOLLET|...` → **ET**。
 
-1. **O(1)** 地返回就绪事件（与总监听数 N 解耦，与就绪数相关）
-2. 无需每次拷贝整个 fd 集合
-3. ET 可减少 `epoll_wait` 返回次数（但编程更挑剔）
+通用事件库可能为降低误用风险默认 LT；部署前以所用版本文档/源码为准。
 
 ### 5.4 使用示例（LT 模式）
 
@@ -648,10 +597,10 @@ for (;;) {
 }
 ```
 
-关键点：
-- `events[i].data.fd` 就是当初 `epoll_ctl` 注册时填入的 fd，内核原样返回。不需要像 select/poll 那样遍历全部 fd 来找"谁就绪了"。`epoll_wait` 返回的数组里**每个元素都是就绪的**。
-- 连接关闭时调 `EPOLL_CTL_DEL` 从内核注销。内核的红黑树会自动清理，再也不会收到这个 fd 的事件。
-- 这个例子用 LT 模式，迁移到 ET 只需把 `EPOLLIN` 改成 `EPOLLIN | EPOLLET`，然后在 `read` 外裹一层读到 `EAGAIN` 的循环。
+说明：
+- `events[i].data.fd` 是注册时写入的值，内核原样带回；返回数组中每一项都是就绪事件，无需再扫全部 fd。
+- 关闭连接时用 `EPOLL_CTL_DEL` 注销。
+- 本例为 LT；改 ET 时加上 `EPOLLET`，并在 `read` 外循环至 `EAGAIN`。
 
 ---
 
@@ -725,11 +674,7 @@ for (;;) {
 
 ## 7. /dev/poll（Solaris）
 
-Solaris 提供的 `/dev/poll` 字符设备接口：用户态写入监视的 poll 结构，通过 `ioctl` 等待事件。
-设计目标与 epoll 类似：避免每次传递完整 poll 数组。
-随着 Solaris 市场份额下降以及 `event ports` 等更新 API 出现，`/dev/poll` 在业界讨论度已很低。
-可以说它是"又一个想干掉 poll O(n) 的 Solaris 方案"。
-
+Solaris 提供的 `/dev/poll` 字符设备接口：用户态写入监视的 poll 结构，通过 `ioctl` 等待事件。设计目标与 epoll 类似：避免每次传递完整 poll 数组。随着 Solaris 市场份额下降以及 `event ports` 等更新 API 出现，讨论度已很低；可视为 Solaris 上针对 poll O(n) 的注册式接口。
 ---
 
 ## 8. Windows IOCP
@@ -754,7 +699,7 @@ flowchart TB
     end
 ```
 
-### 使用示例
+### 使用示例（伪代码）
 
 ```c
 /* 每个连接的状态：重叠结构 + 缓冲区 */
@@ -862,60 +807,58 @@ CQ（Completion Queue，完成队列）
 
 流程：用户态往 SQ 里写 SQE（Submission Queue Entry，提交队列项）→ `io_uring_submit` 通知内核（**一次 syscall**）→ 内核消费 SQ，执行 I/O → 往 CQ 写 CQE（Completion Queue Entry，完成队列项）→ 用户态从 CQ 取 CQE，处理结果。
 
-和 epoll 的本质区别：epoll 用户态和内核态各自持有独立的数据结构（红黑树、就绪链表），每次交互需要 syscall 拷贝。io_uring 的 SQ/CQ 是**同一块物理内存，映射到两个地址空间**。用户态写了 SQE，内核直接就能看到，反之亦然。没数据拷贝，只有必要时的通知。
+和 epoll 的本质区别：epoll 的 interest/ready 结构在内核私有内存中，交互靠 syscall；io_uring 的 SQ/CQ 是**同一块物理内存映射到两边**，控制面元数据不必每次全量拷贝。
 
-常用库：`liburing`（官方辅助库），封装了 ring 初始化和 SQE/CQE 操作。
+**数据缓冲区拷贝**（查询日期 2026-07-17）：普通 `io_uring_prep_read`/`write` 仍会在内核与用户缓冲之间搬数据；`io_uring_register_buffers`（registered/fixed buffer）主要减少反复 pin/map 的开销，**不等于**自动零拷贝（liburing 维护者说明见 [axboe/liburing#1393](https://github.com/axboe/liburing/issues/1393)）。网络侧真正少拷贝需配合 `IORING_OP_SEND_ZC` 等专用操作；文件侧常与 `O_DIRECT` + fixed buffer 相关。见 [io_uring_registered_buffers(7)](https://www.man7.org/linux/man-pages/man7/io_uring_registered_buffers.7.html)。
 
-### 9.3 使用示例
+常用库：`liburing`，封装 ring 初始化与 SQE/CQE 操作。
+
+### 9.3 使用示例（伪代码）
 
 ```c
-char buf[4096];
+char buf[4096];   /* 教学示例：单连接串行 read；多连接并发时须每连接独立缓冲区 */
 struct io_uring ring;
 io_uring_queue_init(256, &ring, 0);     // 256 = SQ/CQ 槽位数
 
-/* ===== 第一步：投递第一个异步 accept ===== */
-struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);    // 从 SQ 取一个空 SQE
-io_uring_prep_accept(sqe, listen_fd, NULL, NULL, 0);    // 填写：我要做异步 accept
-io_uring_sqe_set_data(sqe, NULL);       // 附加数据 NULL → 回调时知道"这是 accept"
-io_uring_submit(&ring);                 // 通知内核：有活了，开始干
+/* 投递异步 accept */
+struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
+io_uring_prep_accept(sqe, listen_fd, NULL, NULL, 0);
+io_uring_sqe_set_data(sqe, NULL);       // user_data=NULL 标记为 accept 完成
+io_uring_submit(&ring);
 
 for (;;) {
-    /* ===== 第二步：等一个 I/O 操作完成 ===== */
     struct io_uring_cqe *cqe;
-    io_uring_wait_cqe(&ring, &cqe);     // 阻塞直到有 CQE 可用
-    /* CQE 里有什么？
-       cqe->res      — 操作结果（accept 返回新 fd，read 返回字节数）
-       cqe->user_data — 当初塞进去的附加数据，用来区分"谁完成了" */
+    io_uring_wait_cqe(&ring, &cqe);
+    /* cqe->res：accept 为新 fd，read 为字节数；失败时为负 errno */
+    /* cqe->user_data：提交时 set_data 写入的标签 */
 
     void *tag = io_uring_cqe_get_data(cqe);
     int res = cqe->res;
-    io_uring_cqe_seen(&ring, &cqe);      // 标记 CQE 已消费，释放槽位
+    io_uring_cqe_seen(&ring, cqe);       // 标记 CQE 已消费（注意：传 cqe，不是 &cqe）
 
     if (tag == NULL) {
-        /* ===== accept 完成 ===== */
-        int client = res;                // res 就是新 client_fd
+        /* accept 完成 */
+        int client = res;
         fcntl(client, F_SETFL, O_NONBLOCK);
 
-        /* 投递异步 read：读这个客户端的数据 */
         sqe = io_uring_get_sqe(&ring);
         io_uring_prep_read(sqe, client, buf, sizeof(buf), 0);
         io_uring_sqe_set_data(sqe, (void *)(intptr_t)client);
         io_uring_submit(&ring);
 
-        /* 同时投递下一个异步 accept（为下一个客户端准备） */
+        /* 再投递下一个 accept */
         sqe = io_uring_get_sqe(&ring);
         io_uring_prep_accept(sqe, listen_fd, NULL, NULL, 0);
         io_uring_sqe_set_data(sqe, NULL);
         io_uring_submit(&ring);
     } else {
-        /* ===== read 完成 ===== */
-        int client = (int)(intptr_t)tag;  // tag 就是当初的 client fd
+        /* read 完成 */
+        int client = (int)(intptr_t)tag;
         if (res <= 0) {
             close(client);
-            /* 不需要像 epoll 那样 EPOLL_CTL_DEL——没投递就不会有完成事件 */
+            /* 未再投递则不会有后续完成事件，无需 epoll 式 DEL */
         } else {
-            /* 数据已在 buf，res 是字节数，直接处理 */
-            /* 处理完后投递下一个 read */
+            /* buf 中已有 res 字节；多连接并发时须每连接独立缓冲 */
             sqe = io_uring_get_sqe(&ring);
             io_uring_prep_read(sqe, client, buf, sizeof(buf), 0);
             io_uring_sqe_set_data(sqe, (void *)(intptr_t)client);
@@ -934,10 +877,10 @@ for (;;) {
 | IOCP | I/O 操作完成了吗 | **内核**代为执行 | `GetQueuedCompletionStatus` | 完成包：操作结果 + 数据已在缓冲区 |
 | io_uring | I/O 操作完成了吗 | **内核**代为执行 | `io_uring_wait_cqe` | CQE：操作结果 + 数据已在缓冲区 |
 
-**批量提交**是 io_uring 另一个独特优势。上面的示例每投一个 SQE 就调一次 `io_uring_submit`，但实际可以攒一批 SQE 后**一次 submit 全部提交**：
+批量提交：上面示例每投一个 SQE 就 `submit` 一次；也可以攒多个 SQE 后一次提交：
 
 ```c
-/* 一次提交多个 I/O 请求，只触发一次 syscall */
+/* 一次 submit 提交多个请求 */
 sqe = io_uring_get_sqe(&ring);
 io_uring_prep_read(sqe, fd1, buf1, 4096, 0);
 io_uring_sqe_set_data(sqe, (void *)1);
@@ -950,10 +893,10 @@ sqe = io_uring_get_sqe(&ring);
 io_uring_prep_accept(sqe, listen_fd, NULL, NULL, 0);
 io_uring_sqe_set_data(sqe, NULL);
 
-io_uring_submit(&ring);  // 一次 syscall，三个 I/O 全提交了
+io_uring_submit(&ring);
 ```
 
-对 PG postmaster 这类"监视个位数 listen socket"的场景，io_uring **没有明显收益**；对追求极限 IOPS 的存储引擎更有吸引力。
+对 postmaster 这种只监视少量 listen socket 的路径，io_uring 收益很小；高 IOPS 存储/网络路径更值得评估。
 
 ---
 
@@ -1013,7 +956,7 @@ for (;;) {
 }
 ```
 
-### 10.3 为何 PG 仍用 select 且完全合理
+### 10.3 为何 PG 仍用 select 且合理
 
 | 因素 | PG 实际情况 | 对 API 选择的影响 |
 |------|-------------|-------------------|
@@ -1023,18 +966,27 @@ for (;;) {
 | 代码年龄与风险 | 核心路径稳定数十年 | 换成 epoll 收益极小、回归风险大 |
 | 循环内还有别的工作 | 启动子进程、检查锁文件、touch socket 等 | `select` 带超时正好驱动周期性任务 |
 
-**对比**：Nginx worker 在**单进程内**维持成千上万**已建立**的连接，必须用 epoll/kqueue；PG 把已建立连接扔给独立 backend 进程，postmaster 只当"门卫"。
+**对比**：Nginx worker 在**单进程内**维持成千上万**已建立**的连接，必须用 epoll/kqueue；PG 把已建立连接交给独立 backend，postmaster 只接受连接并 fork。
 
-### 10.4 两层架构再强调
+### 10.4 accept 竞争：为何 postmaster 几乎碰不到
+
+高并发多 worker 常共享 listen fd，并在各自的 `epoll_wait`/`accept` 上等待。问题分两层：
+
+1. **惊群**：同一连接就绪可能唤醒多个等待者，只有一个能 `accept` 成功，其余空转或再睡（历史上阻塞 `accept` 也曾唤醒全部等待者；多路复用监视同一 listen fd 时仍可能出现类似浪费）。缓解手段包括 `EPOLLEXCLUSIVE`（Linux 4.5+，见 epoll(7)）、`SO_REUSEPORT`（每 worker 独立 listen socket）、或应用层 accept 串行化（如旧版 Nginx `accept_mutex`）。
+2. **负载不均**：共享队列 + 某些唤醒策略可能导致部分 worker 吃到更多连接（见 [Cloudflare: The Sad State of Linux Socket Balancing](https://blog.cloudflare.com/the-sad-state-of-linux-socket-balancing/)）。
+
+postmaster **只有一个进程**对 `ListenSocket[]` 做 `select` → `accept` → `fork`，没有多 acceptor 抢同一连接，因此不必为惊群引入 `EPOLLEXCLUSIVE`/`SO_REUSEPORT`。代价是接受连接的吞吐受单进程限制；PG 的瓶颈通常在 backend 执行与共享资源，不在 postmaster 的 accept 路径。
+
+### 10.5 两层架构
 
 ```
-层次 1 — postmaster：select 监听少量 listen fd → 新连接到来 → fork
-层次 2 — backend 进程：单客户端会话，传统阻塞 read/write，直到断开
+层次 1 — postmaster：select 监听少量 listen fd → 新连接 → fork
+层次 2 — backend：单客户端会话，阻塞 read/write，直到断开
 ```
 
-OpenHalo 继承同一 postmaster 架构；读取MySQL协议适配时，backend 里会有 `T_MySQLProtocol` 分支，但 **postmaster 监听层仍走 PG 的 select 模型**。
+OpenHalo 继承同一 postmaster 架构；MySQL 协议适配落在 backend（如 `T_MySQLProtocol`），**监听层仍走 PG 的 select 模型**。
 
-### 10.5 ServerLoop 在系统中的位置（ASCII）
+### 10.6 ServerLoop 位置（ASCII）
 
 ```
                     ┌─────────────────────────────┐
@@ -1083,14 +1035,13 @@ Linux + 批量磁盘/网络 I/O   → 评估 io_uring
 
 ## 12. 记忆要点
 
-1. **多路复用回答的是"等谁"**；**fork/线程回答的是"谁来做"**。PG 两个都要，各管一层。
-2. **阻塞 read/accept** 让单线程无法服务多连接；多路复用让单线程**同时等待多个 fd**。
-3. **select 三大痛**：1024 上限、fd_set 拷贝、O(n) 扫描。在 PG 里 n≈3，全不构成问题。
-4. **poll 干掉上限，没干掉 O(n)**；**epoll/kqueue 干掉"每次全量传递 + 全量扫描"**。
-5. **LT vs ET**：LT 省心；ET 省事件次数但必须非阻塞 + 读到尽。
-6. **就绪**（epoll）vs **完成**（IOCP/io_uring）：前者返回"可以读了"，后者返回"已经读完了"。
-7. **高并发 Web 服务器**在**单进程内**持有海量连接，必须用 epoll/kqueue；**PG postmaster**只持有监听 socket，select 足够。
-8. **多路复用 + 非阻塞 I/O 是黄金组合**：前者管"等谁"，后者管"处理时不卡住"；只用多路复用但保留阻塞 socket 等于一个慢连接拖死全局。
+1. 多路复用回答“等哪些 fd”；fork/线程回答“谁执行会话”。PG 两层都要。
+2. 阻塞 `read`/`accept` 会占住单线程；多路复用可同时等待多个 fd。处理就绪 fd 时若再用阻塞 `read` 读固定长度，仍可能卡死循环，故常配非阻塞 + 应用层缓冲。
+3. select 三大成本：`FD_SETSIZE`、fd_set 往返拷贝、O(n) 扫描。postmaster 的 n 很小，这些都不构成问题。
+4. poll 去掉硬编码 fd 上限，仍 O(n)；epoll/kqueue 把关注集留在内核，`wait` 按就绪数收割；`epoll_ctl` 约 O(log n)。
+5. LT：条件仍在就反复通知。ET：边沿通知，须非阻塞并读到 `EAGAIN`；未读尽不会“删掉”内核数据，但可能暂时不再通知。
+6. 就绪模型（epoll）返回“可以做 I/O”；完成模型（IOCP/io_uring）返回“操作已结束”。io_uring 共享环减少控制面拷贝，普通 read/write 数据路径仍常有拷贝。
+7. 单进程内海量已建立连接 → 需要 epoll/kqueue；postmaster 只持有 listen socket 且单进程 accept → select 足够，也无多 worker accept 惊群。
 
 ---
 
@@ -1133,4 +1084,4 @@ Windows：MSDN -- *I/O Completion Ports*
 
 ---
 
-*文档版本：2025-06，基于 PostgreSQL 14.18 postmaster 实现整理。*
+*文档整理基于 PostgreSQL 14.18 postmaster；事实核对日期 2026-07-17（POSIX/Linux man、Nginx/Redis 源码与官方文档）。*

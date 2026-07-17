@@ -2,20 +2,13 @@
 
 ## 1. 目的
 
-沿一条完整 SQL 路径标注 **Foreign Data Wrapper** 各回调的触发阶段：自 **TCOP**（`exec_simple_query`）经 **Analyzer → Rewriter → Planner → Executor**（参见 [`sql_pipeline_faq.md`](sql_pipeline_faq.md)），至外表扫描、修改与工具命令。以 **postgres_fdw** 为参考实现，对照 `doc/src/sgml/fdwhandler.sgml` 与 `src/include/foreign/fdwapi.h` 中的 `FdwRoutine`。
-
-**相关文档**
-
-| 文档 | 内容 |
-|------|------|
-| `fdw_planning_walkthrough.md` | 规划期走读 |
-| `sql_pipeline_faq.md` | SQL 五站管线（§1.1 TCOP、§5 Planner、§6 Executor） |
+沿一条完整 SQL 路径标注 **Foreign Data Wrapper** 各回调的触发阶段：自 **TCOP**（`exec_simple_query`）经 **Analyzer → Rewriter → Planner → Executor**，至外表扫描、修改与工具命令。以 **postgres_fdw** 为参考实现，对照 `doc/src/sgml/fdwhandler.sgml` 与 `src/include/foreign/fdwapi.h` 中的 `FdwRoutine`。
 
 **阶段标记**（全文统一）：`plan` = 规划器；`exec` = 执行器（含 `EXPLAIN` 对计划节点的解释回调）；`util` = 独立命令、元数据或规则期，不走典型 SELECT 执行树。
 
 ## 2. 主线与分叉（教学路线图）
 
-> **46 回调完整清单、源码行号、postgres_fdw 实现状态见附录**；本节只讲何时、为何调用。规划细节见 `fdw_planning_walkthrough.md`。
+> **46 回调完整清单、源码行号、postgres_fdw 实现状态见附录**；本节只讲何时、为何调用。
 
 ### 2.0 三十秒读懂
 
@@ -23,7 +16,7 @@
 
 1. **Parser → Analyzer → Rewriter**：内核把 SQL 文本变成 `Query` 语义树。这三步**不调 FDW**，外表此时只是一个 `RangeTblEntry` 条目。
 2. **Planner**（第 4 站）：`Query` 送进优化器，为外表估大小（`GetForeignRelSize`）、选路径（`GetForeignPaths`）、定计划（`GetForeignPlan`）。这是 FDW **第一次**被调起。
-3. **Executor**（第 5 站）：`PortalRun` 驱动计划树，对 `ForeignScan` 节点调 `BeginForeignScan` → `IterateForeignScan`（逐行循环）→ `EndForeignScan`，真正从远程拉数据。
+3. **Executor**（第 5 站）：`PortalRun` 驱动计划树，对 `ForeignScan` 节点调 `BeginForeignScan` → `IterateForeignScan`（逐行循环）→ `EndForeignScan`；若需重扫则插入 `ReScanForeignScan`。真正从远程拉数据发生在 `IterateForeignScan`。
 
 以上三步就是 **FDW 的主链**（查或改数据）。同一条 `exec_simple_query` 还可能有另外两条岔路：
 - **Utility 岔路**：`TRUNCATE` / `ANALYZE` / `IMPORT FOREIGN SCHEMA` 不走规划+Portal，直接由 `ProcessUtility` 调 FDW。
@@ -51,7 +44,7 @@ flowchart LR
   end
 ```
 
-> 重写后查改/维护支路仅在**涉及外表**（或外表相关对象）时调 FDW；纯本地 SQL 仍不进 FDW。主链之外的元数据旁路（图 7 入口 A）及 DML 内嵌门禁（入口 B）见 **§2.2 路径 4/5**。
+> 重写后查改/维护支路仅在**涉及外表**（或外表相关对象）时调 FDW；纯本地 SQL 仍不进 FDW。主链之外的元数据旁路（图 7 入口 A）及 DML 内嵌门禁（入口 B）见 **§2.8 路径 4/5**。
 
 
 ### 2.1 主线：一条 SELECT 从进到出（五站）
@@ -75,7 +68,7 @@ flowchart LR
   A -.- afdw["FDW：无"]
   R -.- rfdw["FDW：无"]
   L -.- lfdw["涉及外表时<br/>FDW：规划期<br/>GetForeignRelSize<br/>GetForeignPaths<br/>GetForeignPlan"]
-  E -.- efdw["涉及外表时<br/>FDW：执行期<br/>BeginForeignScan<br/>IterateForeignScan<br/>EndForeignScan"]
+  E -.- efdw["涉及外表时<br/>FDW：执行期<br/>Begin / Iterate / ReScan? / End"]
 ```
 
 | 站 | 内核调用 | FDW 是否参与 | 解释 |
@@ -134,7 +127,7 @@ flowchart TD
 - **第 1–3 站** Parser / Analyzer / Rewriter **不调用** FDW。
 - **两个菱形** = 两条岔路：Rewriter 之后选查改（→ 图 3）或 Utility（→ 图 6）；Portal 执行后按顶层节点选读（图 4）、写（图 5）或 EXPLAIN（图 8）。
 - **规划与执行不同阶段**：图 3 在 `pg_plan_query` 内；图 4/5/8 在 `PortalRun` 后的执行器里。`SELECT * FROM ft` 的路径就是 `图 3 + 图 4`。
-- **图 7 两入口**（见 **§2.2 路径 5**）：**入口 A** 为与菱形无连边的元数据查询；**入口 B** 在写分支上用虚线标注，属 DML 第 5 站初始化，**在**查改主链内。
+- **图 7 两入口**（见 **§2.8 路径 5**）：**入口 A** 为与菱形无连边的元数据查询；**入口 B** 在写分支上用虚线标注，属 DML 第 5 站初始化，**在**查改主链内。
 
 **图例**：菱形 ⬦ = 二选一决策点，同一条 SQL 只沿一侧出边。虚线 = 主链外入口或旁路标注。
 
@@ -251,12 +244,15 @@ flowchart TD
 
   CMD2 -->|"SELECT"| GPS
   CMD2 -->|"INSERT"| PMI
-  CMD2 -->|"UPDATE / DELETE"| GPU & PMU
+  CMD2 -->|"UPDATE / DELETE"| GPU
+  GPU --> PMU
+  PMU -.->|"或整句下推"| PD
 
   GPS --> OUT_R["→ 图 4 执行读"]
   PMI --> OUT_W["→ 图 5 执行写"]
   GPU --> OUT_W
   PMU --> OUT_W
+  PD --> OUT_W
 
   CP -.-> OAS
 ```
@@ -285,7 +281,7 @@ flowchart TD
 
 - **DML junk 细节**：`grouping_planner` 在 `query_planner` 之前执行 `preprocess_targetlist`（planner.c:1908），对 UPDATE/DELETE/MERGE 的 result rel 调 `add_row_identity_columns()`；外表分支调 `AddForeignUpdateTargets` 补远程 rowid；`UPDATE` 还可能补 `wholerow` Var（appendinfo.c:998–1022）。junk 列随后进入 `ModifyTable` / Direct Modify 计划。
 - **可选特性**：虚线 `-.->` 表示"同期考量"或"后置判定"。`GetForeignUpperPaths` 在 `query_planner` 返回**之后**调用；`GetForeignRowMarkType` 经 `preprocess_rowmarks` 可在 junk 之前执行；`IsForeignScanParallelSafe` 与 `GetForeignRelSize` 在同一循环内先后执行。精确时序见 **附录二 §2.1**。
-- **postgres_fdw**：12 个 plan 回调中实现 9 个；未实现并行安全、分区重参数化、自定义行锁类型（附录一 §1.6）。
+- **postgres_fdw**：plan 扩展 12 项中实现 9 个；未实现并行安全、分区重参数化、自定义行锁类型（附录一 §1.6）。
 
 ---
 
@@ -370,7 +366,7 @@ flowchart TD
   CP_E["COPY 结束 · 外表<br/>EndForeignInsert()<br/>copyfrom.c"]
 ```
 
-- **触发条件**：`INSERT`/`UPDATE`/`DELETE`/`COPY FROM` 目标为外表；规划期见 **§2.8 路径 2/3**（`AddForeignUpdateTargets` → `PlanForeignModify` 或 `PlanDirectModify`）。执行期在 `ExecInitModifyTable` / `CopyFrom` 内经**入口 B** `CheckValidResultRel` → `IsForeignRelUpdatable`（早于 `ExecInitNode` 子计划）。
+- **触发条件**：`INSERT`/`UPDATE`/`DELETE`/`COPY FROM` 目标为外表；规划期见 **§2.8 路径 2/3**（UPDATE/DELETE 经 `AddForeignUpdateTargets`；INSERT 经 `PlanForeignModify` 或 `PlanDirectModify`）。执行期在 `ExecInitModifyTable` / `CopyFrom` 内经**入口 B** `CheckValidResultRel` → `IsForeignRelUpdatable`（早于 `ExecInitNode` 子计划）。
 - **junk 在实际执行中的作用**：规划期补入的 junk 列（ctid / 远程 rowid / wholerow）随 `ForeignScan` 或 `ModifyTable` 子计划下发；`ExecForeignUpdate` / `ExecForeignDelete` 据此构造远程 `WHERE` 子句（postgres_fdw 在 `deparse.c` 完成）。Direct Modify 整句下推时 junk 在远程 SQL 内消化，本地不逐行调用 `ExecForeignUpdate`。
 - **与主流程关系**：**图 2** **Portal 执行后决策点**的三条写分支（Direct Modify / ModifyTable / COPY）。ModifyTable / COPY 在节点初始化时嵌**入口 B**（`CheckValidResultRel` → `IsForeignRelUpdatable`），与 **图 7** 入口 B 同链。
 - **postgres_fdw**：三条写路径均实现；批量插入与 `GetForeignModifyBatchSize` 用于 COPY/批量 INSERT。
@@ -495,7 +491,7 @@ flowchart TB
 
 | 场景 | plan | exec |
 |------|------|------|
-| `INSERT`（ModifyTable） | PlanForeignModify | BeginForeignModify → ExecForeignInsert/BatchInsert → GetForeignModifyBatchSize → EndForeignModify |
+| `INSERT`（ModifyTable） | PlanForeignModify | GetForeignModifyBatchSize → BeginForeignModify → ExecForeignInsert/BatchInsert → EndForeignModify |
 | `COPY FROM` 外表 | — | BeginForeignInsert → GetForeignModifyBatchSize → ExecForeignInsert/BatchInsert → EndForeignInsert（`CopyFrom`，不经 ForeignScan 节点） |
 
 见 **§2.4 图 5**（三支写路径）；可更新性门禁见 **路径 2**（入口 B）。
@@ -539,15 +535,17 @@ flowchart TB
 
 ---
 
-## 附录一、回调计数（原 §1）
+## 附录一、回调计数
 
 权威来源：`fdwapi.h` 中 `FdwRoutine` 共 **46** 个函数指针；`fdwhandler.sgml` §"Foreign Data Wrapper Callback Routines"说明其中 **7 个扫描相关为必填**，其余可选（NULL 表示不提供）。
 
+**口径说明**：下表按 **46 个 API 字段** 互斥分类，四行相加等于 46。§1.1 / §1.2 的「plan 扩展 12」「exec 扩展 30」是**含必填在内的阶段汇总**（12 = 扫描 plan 3 + plan 可选 9；30 = 扫描 exec 4 + exec 可选 26），不要与下表四行再加总。postgres_fdw 实现数为 **37/46**（NULL×9）。
+
 | 分类 | API 字段数 | 文档要求 | postgres_fdw 实现 |
 |------|------------|----------|-------------------|
-| 扫描（plan 3 + exec 4） | 7 | **7 必填** | 7 |
-| plan 扩展 | 12 | 可选 | 9（NULL×3） |
-| exec 扩展 | 23 | 可选 | 16（NULL×7） |
+| 扫描必填（plan 3 + exec 4） | 7 | **7 必填** | 7 |
+| plan 可选（不含扫描 plan 3） | 9 | 可选 | 6（NULL×3） |
+| exec 可选（不含扫描 exec 4） | 26 | 可选 | 19（NULL×7） |
 | util / 元数据 | 4 | 可选 | 4 |
 | **合计** | **46** | 7 必填 + 39 可选 | **37** / **NULL×9** |
 
@@ -660,13 +658,13 @@ flowchart TB
 > `contrib/postgres_fdw/postgres-fdw.sgml` 中的 `parallel_commit` / `parallel_abort` 指**事务结束**时多 server 并行提交/回滚，与 `IsForeignScanParallelSafe` / Gather 并行扫描无关。
 
 ---
-## 附录二、主表：FdwRoutine 全回调（46）（原 §2）
+## 附录二、主表：FdwRoutine 全回调（46）
 
 **postgres_fdw**：`Y` = `postgres_fdw_handler` 赋值非 NULL；`N` = 留 NULL。
 
 **内核路径**：仅列 `src/backend/` 内在指针非 NULL 时**实际调用** `fdwroutine->…(...)` 的站点（不含仅做 `== NULL` 探测的代码）。同一回调多站点用 `<br>` 分行。
 
-> **想看参数签名？** 每个回调的完整函数签名见 `src/include/foreign/fdwapi.h`（208–286 行）或官方文档 `doc/src/sgml/fdwhandler.sgml` 对应子节。
+> **参数签名**：每个回调的完整函数签名见 `src/include/foreign/fdwapi.h`（208–286 行）或官方文档 `doc/src/sgml/fdwhandler.sgml` 对应子节。
 
 | # | 回调 | fdwhandler.sgml 小节 | 必填/可选 | 内核调用点（函数, file.c:line） | 内核路径 | postgres_fdw |
 |---|------|----------------------|-----------|--------------------------------|----------|--------------|
@@ -765,7 +763,7 @@ flowchart TB
 > exec 期增删改、COPY、EXPLAIN、EPQ、行锁等回调的直接调用见 **§2 主表**；在 TCOP 中的落点见 **§2.1** 与 **§2.2–§2.7**。
 
 ---
-## 附录三、最小触发 SQL 速查（原 §3.4）
+## 附录三、最小触发 SQL 速查
 
 **# 与附录二 §2 主表一致**。
 
@@ -820,12 +818,7 @@ flowchart TB
 
 > **`ImportForeignStatistics` / `AnalyzeForeignTable` 互斥**：`analyze_rel` 外表分支优先 `ImportForeignStatistics`，否则 `AnalyzeForeignTable`（analyze.c:230–238）。
 
----
-
-
----
-
-## 3. 源码索引
+## 附录四、源码索引
 
 | 资源 | 位置 |
 |------|------|
@@ -833,7 +826,5 @@ flowchart TB
 | 回调语义（官方文档） | `doc/src/sgml/fdwhandler.sgml`（`fdw-callbacks` 及各子节） |
 | postgres_fdw 注册 | `contrib/postgres_fdw/postgres_fdw.c` `postgres_fdw_handler` 约 770–830 行 |
 | `GetFdwRoutine*` 基础设施 | `src/backend/foreign/foreign.c` |
-| 规划期走读 | `fdw_planning_walkthrough.md` |
-| SQL 管线 FAQ | `sql_pipeline_faq.md` |
 
 *行号对应当前 workspace。合并上游后可能偏移。*

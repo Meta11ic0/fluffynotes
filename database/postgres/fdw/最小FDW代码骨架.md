@@ -1,6 +1,8 @@
-# 从零开始搭建一个 FDW
+# 最小 FDW 代码骨架与回调说明
 
-本文以 `test_fdw` 为例，目标是让 `test_fdw` 能被创建、能触发 validator、能走完最基础的扫描回调链路。
+> 定位：对照规划/执行链路的 **最小代码骨架**与 **7 个扫描回调**说明，不是「从零搭到可安装扩展」教程。**不含** `Makefile` / `.control` / 编译安装步骤；SQL 注册见 §4.2。骨架里的 `create_foreignscan_path` 按 **PostgreSQL 18 / current** 签名书写（含 `disabled_nodes`、`fdw_restrictinfo`）；PG 16/17 参数列表不同，见 §5.2。
+
+以 `test_fdw` 为例，目标是看清 handler、validator 与扫描回调的触发顺序。
 
 ---
 
@@ -21,9 +23,9 @@
 
 ### 1.1 业务 SQL 与规划器名词的对照
 
-从**业务 SQL** 看，`FROM` 子句里的**外表（`FOREIGN TABLE`）**就是一张**逻辑上的表**。凡是要写 SQL 的人（应用开发、分析脚本、运维等），都能像普通表一样写 `SELECT ... WHERE ... JOIN ...`（具体能否下推、能否 join 取决于 FDW 能力）。**FDW** 则是这类表背后的访问协议与实现，由 `CREATE FOREIGN DATA WRAPPER` 注册，`SERVER` / `USER MAPPING` / 表级 `OPTIONS` 提供连接与行为参数。
+从**业务 SQL** 看，`FROM` 子句里的**外表（`FOREIGN TABLE`）**就是一张**逻辑上的表**，可像普通表一样写 `SELECT ... WHERE ... JOIN ...`（具体能否下推、能否 join 取决于 FDW 能力）。**FDW** 则是这类表背后的访问协议与实现，由 `CREATE FOREIGN DATA WRAPPER` 注册，`SERVER` / `USER MAPPING` / 表级 `OPTIONS` 提供连接与行为参数。
 
-从**规划器/执行器内核**看，后文出现的类型可以一句话对齐为：
+从规划器/执行器内核看，后文出现的类型可先对齐为：
 
 
 | 名词                     | 白话含义                                                                                 |
@@ -44,6 +46,7 @@
 
 ```c
 #include "postgres.h"            /* Datum, PG_FUNCTION_ARGS, PG_RETURN_*, ereport/errmsg */
+#include "fmgr.h"                /* PG_FUNCTION_INFO_V1, PG_MODULE_MAGIC */
 #include "foreign/fdwapi.h"      /* FdwRoutine, PlannerInfo/RelOptInfo/ForeignScanState 等回调签名 */
 #include "optimizer/pathnode.h"  /* add_path, create_foreignscan_path (testGetForeignPaths 用) */
 #include "optimizer/planmain.h"  /* make_foreignscan (testGetForeignPlan 用) */
@@ -117,8 +120,17 @@ testGetForeignPaths(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid)
 {
     ereport(NOTICE,
             (errmsg("test_fdw: GetForeignPaths foreigntableid=%u", foreigntableid)));
-    add_path(baserel, (Path *) create_foreignscan_path(root, baserel, NULL,
-                                                        baserel->rows, 0, 0, NIL, NULL, NULL, NIL));
+    add_path(baserel, (Path *) create_foreignscan_path(root, baserel,
+                                                        NULL,			/* default pathtarget */
+                                                        baserel->rows,
+                                                        0,				/* disabled_nodes */
+                                                        0,				/* startup_cost */
+                                                        0,				/* total_cost */
+                                                        NIL,			/* pathkeys */
+                                                        NULL,			/* required_outer */
+                                                        NULL,			/* fdw_outerpath */
+                                                        NIL,			/* fdw_restrictinfo */
+                                                        NIL));			/* fdw_private */
 }
 
 static ForeignScan *
@@ -200,9 +212,9 @@ SELECT add_one(41);  -- 42
 这个例子说明 PG 的函数模型分两层：
 
 - C 层：统一写成 `Datum func(PG_FUNCTION_ARGS)`，通过 `PG_GETARG_*`/`PG_RETURN_*` 取参与返回
-- SQL 层：声明参数类型、返回类型、语言和符号映射
+- SQL 层：声明参数类型、返回类型、语言和符号映射；`AS 'MODULE_PATHNAME', 'add_one'` 表示「当前扩展共享库里的符号 `add_one`」（安装时由扩展机制替换路径）
 
-理解了 `add_one` 再看 FDW 的 `handler`/`validator`：它们也是 V1 函数，只是调用方通常是内核而不是业务 SQL。
+理解了 `add_one` 再看 FDW 的 `handler`/`validator`：它们也是 V1 函数，只是调用方通常是内核（加载 FDW / 校验 OPTIONS）而不是业务 `SELECT`。
 
 ### 3.2 handler 和 validator 的调用方式
 
@@ -248,15 +260,9 @@ if (OidIsValid(fdwvalidator))
 }
 ```
 
-`handler`、`validator` 虽然不是典型业务函数，但它们依旧是 fmgr 调用的 C 函数入口。
-
-用户就算强行 `SELECT test_fdw_handler()`，返回也是 `fdw_handler` 这种内部伪类型（本质是内部指针封装），没有业务语义。
-
----
+`handler`、`validator` 虽非典型业务函数，但一样由 fmgr 调用，因此同样需要 `PG_FUNCTION_INFO_V1`。若对 `test_fdw_handler()` 做 `SELECT` 调用，返回的是 `fdw_handler` 内部伪类型（指针封装），无业务语义。
 
 ### 3.3 PG_MODULE_MAGIC：.so 加载时的安全门
-
----
 
 在 `.c` 文件的最顶部（只能出现一次）：
 
@@ -454,7 +460,7 @@ typedef struct FunctionCallInfoBaseData
 
 ### 4.1 handler 的职责：交出回调函数指针表
 
-handler 函数只做一件事：分配一个 `FdwRoutine`，填好函数指针，返回给规划器。
+handler 函数只做一件事：分配一个 `FdwRoutine`，填好函数指针，经 `GetFdwRoutine` 交给规划器/执行器。
 
 `FdwRoutine` 定义在 `src/include/foreign/fdwapi.h`，是一张回调函数指针表：
 
@@ -674,7 +680,7 @@ if (def->arg == NULL)
              errmsg("%s requires a parameter", def->defname)));
 ```
 
-1. `defGetString(def)` 的实现对 `arg` 会做严格检查：`arg == NULL` 直接报错，节点类型不支持也报错（见 `src/backend/commands/define.c`）：
+2. `defGetString(def)` 的实现对 `arg` 会做严格检查：`arg == NULL` 直接报错，节点类型不支持也报错（见 `src/backend/commands/define.c`）：
 
 ```c
 char *
@@ -697,7 +703,7 @@ defGetString(DefElem *def)
 }
 ```
 
-1. `defGetString(def)` 正常路径一般不会返回 `NULL`。代码里写 `val ? val : "<null>"` 更多是防御式写法，让调试输出更稳健。
+3. `defGetString(def)` 正常路径一般不会返回 `NULL`。代码里写 `val ? val : "<null>"` 更多是防御式写法，让调试输出更稳健。
 
 **`defGetString`**（声明：`src/include/commands/defrem.h`）
 
@@ -780,7 +786,7 @@ testGetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid
 }
 ```
 
-**总结**：只写 `rows = 1` 是为让规划继续；真实 FDW 会读 options、远端统计或 `EXPLAIN` 等。依赖 `foreign/fdwapi.h`（签名与类型）。教学骨架刻意**不连远端**，只把 `baserel->rows` 设成常数即可把规划链跑通。部分成熟的 FDW 在 `GetForeignRelSize` **内就会建立连接**，做的却不限于"估行"一条线。
+只写 `rows = 1` 是为让规划继续；真实 FDW 会读 options、远端统计或 `EXPLAIN` 等。依赖 `foreign/fdwapi.h`（签名与类型）。教学骨架刻意不连远端，只把 `baserel->rows` 设成常数即可把规划链跑通。部分成熟的 FDW 在 `GetForeignRelSize` 内就会建立连接，做的也不限于「估行」一条线。
 
 ---
 
@@ -816,44 +822,56 @@ testGetForeignPaths(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid)
 {
     ereport(NOTICE,
             (errmsg("test_fdw: GetForeignPaths foreigntableid=%u", foreigntableid)));
-    add_path(baserel, (Path *) create_foreignscan_path(root, baserel, NULL,
-                                                        baserel->rows, 0, 0, NIL, NULL, NULL, NIL));
+    add_path(baserel, (Path *) create_foreignscan_path(root, baserel,
+                                                        NULL,			/* default pathtarget */
+                                                        baserel->rows,
+                                                        0,				/* disabled_nodes */
+                                                        0,				/* startup_cost */
+                                                        0,				/* total_cost */
+                                                        NIL,			/* pathkeys */
+                                                        NULL,			/* required_outer */
+                                                        NULL,			/* fdw_outerpath */
+                                                        NIL,			/* fdw_restrictinfo */
+                                                        NIL));			/* fdw_private */
 }
 ```
 
-`create_foreignscan_path` 原型见 `src/include/optimizer/pathnode.h`：
+`create_foreignscan_path` 原型见 `src/include/optimizer/pathnode.h`（**PostgreSQL 18 / current**，查询日期 2026-07-17）：
 
 ```c
 ForeignPath *create_foreignscan_path(PlannerInfo *root, RelOptInfo *rel,
                                      PathTarget *target,
-                                     double rows, Cost startup_cost, Cost total_cost,
+                                     double rows, int disabled_nodes,
+                                     Cost startup_cost, Cost total_cost,
                                      List *pathkeys,
                                      Relids required_outer,
                                      Path *fdw_outerpath,
+                                     List *fdw_restrictinfo,
                                      List *fdw_private);
 ```
 
-**要点**：`NIL` 只适用于 **`List *`** 形参（此处为 `pathkeys`、`fdw_private`）。**`Path *` / `Relids`** 的空指针必须用 **`NULL`**，否则类型错误且可能在不同平台上引发告警或 ABI 问题。
+版本差异（易踩坑）：PG 16 无 `disabled_nodes`、无 `fdw_restrictinfo`；PG 17 有 `fdw_restrictinfo`、无 `disabled_nodes`。对照本地头文件再改调用实参。
 
-**总结**：依赖 `optimizer/pathnode.h`（`add_path`、`create_foreignscan_path`）。真实 FDW 会算成本、多 path、`fdw_private` 等。
+**要点**：`NIL` 只适用于 **`List *`**（`pathkeys`、`fdw_restrictinfo`、`fdw_private`）。**`Path *` / `Relids`** 的空值用 **`NULL`**，不要写 `NIL`。
+
+依赖 `optimizer/pathnode.h`（`add_path`、`create_foreignscan_path`）。真实 FDW 会算成本、多 path、`fdw_private` 等。
 
 ---
 
 ### 5.3 `testGetForeignPlan`
 
-`GetForeignPlan` 的角色是：把优化器最终选中的 `ForeignPath` 转换成可执行的 `ForeignScan` 计划节点。  
-它不仅“组装节点”，还要决定 quals 的远端/本地分工，并把执行阶段所需私有信息装入节点字段。
+`GetForeignPlan` 把选中的 `ForeignPath` 落成可执行的 `ForeignScan`，并决定 quals 的远端/本地分工，把执行期私有信息写入节点字段。
 
-这里的 **quals** 指“需要由当前 plan 节点约束/检查的条件表达式（过滤条件）”。在 `GetForeignPlan` 语境下，主要对应 `scan_clauses` 这组 restriction clauses（限制条件）。
+此处 **quals** 主要指交给该 `ForeignScan` 的 restriction clauses，即参数 `scan_clauses`。
 
-官方文档证据（`fdw-callbacks`）：
+官方文档（`fdw-callbacks`）：
 
 ```text
 ... the target list to be emitted by the plan node, the restriction clauses
 to be enforced by the plan node ...
 ```
 
-内核源码证据（`src/backend/optimizer/plan/createplan.c`）：
+调用点（`src/backend/optimizer/plan/createplan.c`）：
 
 ```c
 /*
@@ -1058,13 +1076,13 @@ testBeginForeignScan(ForeignScanState *node, int eflags)
 }
 ```
 
-该实现刻意“不做任何初始化”，目的是先验证回调链路可达；真实 FDW 通常在这里建立连接、初始化游标和私有状态。
+该实现刻意不做初始化，只验证回调可达。真实 FDW 通常在此建立连接、初始化游标和私有状态。若 `(eflags & EXEC_FLAG_EXPLAIN_ONLY)`，官方文档要求不做对外可见动作，只保证节点状态足以支撑 `ExplainForeignScan` / `EndForeignScan`。
 
 ---
 
 ### 5.5 `testIterateForeignScan`
 
-`IterateForeignScan` 是逐行取数回调：每调用一次产出一行，直到返回空 slot/NULL 表示 EOF。
+`IterateForeignScan` 逐行取数：每调用一次产出一行。官方文档写明无更多行时返回 `NULL`；实现上也常见 `ExecClearTuple(slot)` 后返回该 slot。执行器经 `TupIsNull` 两者都当作 EOF。
 
 函数签名（`fdwapi.h`）：
 
@@ -1137,7 +1155,7 @@ testReScanForeignScan(ForeignScanState *node)
 }
 ```
 
-**总结**：无远端状态时可为空；真实 FDW 需重绑/重执行远端语句。依赖：`foreign/fdwapi.h`。
+无远端状态时可为空；真实 FDW 需重绑/重执行远端语句。依赖：`foreign/fdwapi.h`。
 
 ---
 
@@ -1173,47 +1191,29 @@ testEndForeignScan(ForeignScanState *node)
 }
 ```
 
-**总结**：骨架可为空；真实 FDW 关闭 statement/连接等。依赖：`foreign/fdwapi.h`。
+骨架里 `EndForeignScan` 可为空；真实 FDW 在此关闭 statement、远端连接等。依赖：`foreign/fdwapi.h`。
 
 ---
 
 ### 5.8 这 7 个回调与当前最小骨架的关系
 
-按执行顺序，这 7 个回调的职责是：
+按执行顺序：
 
-1. `GetForeignRelSize`：先给规划器一个大小估计
-2. `GetForeignPaths`：再提供一个可选扫描路径
+1. `GetForeignRelSize`：给规划器一个大小估计
+2. `GetForeignPaths`：提供可选扫描路径
 3. `GetForeignPlan`：把选中的路径变成 `ForeignScan` 计划节点
 4. `BeginForeignScan`：执行前初始化
-5. `IterateForeignScan`：一行一行产出结果
+5. `IterateForeignScan`：逐行产出结果
 6. `ReScanForeignScan`：需要重扫时重置状态
 7. `EndForeignScan`：结束时释放资源
 
-真实 FDW 的”最小 SELECT 扫描链路”核心就是这 7 个回调。  
-本文 `test_fdw` 只做最小骨架验证，策略是：
+真实 FDW 的「最小 SELECT 扫描链路」主要就是这 7 个。本文 `test_fdw` 只验证骨架：规划阶段给最简 rows/path/plan；执行阶段证明回调能进来；用空 slot 返回、不做真实远端访问；调试优先 `NOTICE`，而不是一上来实现完整扫描。
 
-- 规划阶段：只给最简单的 rows/path/plan
-- 执行阶段：只证明回调链路能进来
-- 返回结果：直接返回空 slot，不做真实远端访问
-- 调试方式：优先 `NOTICE` 打印，而不是一上来就实现真实扫描
+骨架依赖的头文件：`foreign/fdwapi.h`、`optimizer/pathnode.h`、`optimizer/planmain.h`、`optimizer/restrictinfo.h`、`executor/tuptable.h`、`access/reloptions.h`、`commands/defrem.h`。
 
-这也是骨架需要的头文件较少的原因：
+适用边界：本文只验证回调可达性与空结果返回。接入 catalog/options、远端连接与真实扫描需另行扩展，通常仍从同一 7 回调入手。
 
-- `foreign/fdwapi.h`：所有 FDW 回调签名与核心类型
-- `optimizer/pathnode.h`：`add_path`、`create_foreignscan_path`
-- `optimizer/planmain.h`：`make_foreignscan`
-- `optimizer/restrictinfo.h`：`extract_actual_clauses`
-- `executor/tuptable.h`：`ExecClearTuple`
-- `access/reloptions.h`：validator 解析 options
-- `commands/defrem.h`：validator 把 `DefElem` 的值转成字符串
-
-如果后续从”最小骨架”升级到”真实 FDW”，通常下一步要补充的是：
-
-- 读取 catalog / options
-- 设计 FDW 私有状态结构
-- 在 `Begin/Iterate/End` 中接入真实远端访问逻辑
-
-## 官方参考
+## 6. 官方参考
 
 下列链接基于 **PostgreSQL 当前手册**（`/docs/current/`）。若本地有源码树，可同时对照 `doc/src/sgml/` 下同名 `.sgml`。
 
